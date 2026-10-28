@@ -1,0 +1,3698 @@
+# Gumbel copula + exponential margins
+# Mixed censoring with a terminal primary outcome
+# Primary comparison: [0, tau]; secondary trimmed comparison: [tau_lower, tau]
+
+suppressPackageStartupMessages({
+  library(splines)
+  library(copula)
+  library(parallel)
+  library(doParallel)
+  library(foreach)
+})
+
+# Simulation settings
+
+M <- 500L
+B <- 200L
+NMC_TRUTH <- 5000000L
+output_tag <- "Gumbel_mixed_exponential_tau5_TRIMMED_UNTRIMMED_SAME_SIM_FINAL"
+
+size <- 200L
+tau <- 5.0
+
+## Exponential event margins.
+lambC <- 0.15
+lambT <- 0.10
+muC   <- 0.30
+muT   <- 0.20
+
+## Primary independent censoring.
+censor_rate_primary <- 0.04
+
+## Fixed sieve dimension.
+k.i <- 6L
+n.spline <- k.i
+sk.i <- k.i^2
+spline.ord <- 4L
+p_alpha <- sk.i + 2L*k.i
+
+## Numerical integration grid.
+dt <- 0.02
+ds <- 0.02
+
+## Dependence.
+## Gumbel Kendall tau = 1 - 1/theta.
+## theta = 1.5 gives Kendall tau = 1/3.
+theta <- 1.5
+kendall_tau <- 1 - 1/theta
+
+USE_PARALLEL <- TRUE
+N_CORES <- max(1L, parallel::detectCores() - 1L)
+
+OUTPUT_DIR <- getwd()
+
+truth_seed <- 12345L
+simulation_seed <- 20260815L
+
+## Likelihood parameterization: k^2 + 2k coefficients.
+
+sumvectorfunction <- function(alpha, ispx, mspx, ispu, ispv)
+{
+  mu <- t(matrix(alpha[1 : sk.i], k.i, k.i))
+  omega <- matrix(alpha[(sk.i+k.i+1) : (sk.i+2*k.i)], k.i, 1)
+  pi <- matrix(alpha[(sk.i+1) : (sk.i+k.i)], k.i, 1)
+
+  fxu <- diag(t(ispx) %*% mu %*% ispu)
+  dfxu <- diag(t(mspx) %*% mu %*% ispu)
+  fxv <- diag(t(ispx) %*% mu %*% ispv)
+  dfxv <- diag(t(mspx) %*% mu %*% ispv)
+
+  fx <- diag(t(ispx) %*% mu %*% matrix(1, n.spline, size)) + c(t(ispx) %*% omega)
+  dfx <- diag(t(mspx) %*% mu %*% matrix(1, n.spline, size)) + c(t(mspx) %*% omega)
+  fu <- diag(matrix(1, size, n.spline) %*% mu %*% ispu) + c(t(ispu) %*% pi)
+  fv <- diag(matrix(1, size, n.spline) %*% mu %*% ispv) + c(t(ispv) %*% pi)
+
+  sum11 <- dfxu
+  sum22 <- dfxv - dfxu
+  sum33 <- dfx - dfxv
+  sum44 <- fu - fxu
+  sum55 <- fv - fu - fxv + fxu
+  sum66 <- 1 - fv - fx + fxv
+
+  list(sum11=sum11, sum22=sum22, sum33=sum33, sum44=sum44, sum55=sum55, sum66=sum66)
+}
+
+sumfunction_w <- function(sum11,sum22,sum33,sum44,sum55,sum66,
+                          data1,data2,data3,data4,data5,data6,
+                          w)
+{
+  probs <- list(sum11,sum22,sum33,sum44,sum55,sum66)
+  dats  <- list(data1,data2,data3,data4,data5,data6)
+
+  total <- 0
+  for (j in seq_along(probs)) {
+    idx <- dats[[j]] != 0
+    if (!any(idx)) next
+
+    pj <- probs[[j]][idx]
+
+    ## Numerical safeguard only: candidate points outside the valid
+    ## likelihood region are rejected by the line search.
+    if (any(!is.finite(pj)) || any(pj <= 0)) return(-Inf)
+
+    total <- total + sum(w[idx] * log(pj))
+  }
+
+  total
+}
+
+gg_pre_w <- function(ispx, mspx, ispu, ispv,
+                     data1, data2, data3, data4, data5, data6,
+                     noze1, noze2, noze3, noze4, noze5, noze6,
+                     sum11, sum22, sum33, sum44, sum55, sum66,
+                     w)
+{
+  ddpre <- matrix(0, (sk.i+2*k.i), 1)
+
+  idx1 <- which(data1 != 0); idx2 <- which(data2 != 0); idx3 <- which(data3 != 0)
+  idx4 <- which(data4 != 0); idx5 <- which(data5 != 0); idx6 <- which(data6 != 0)
+
+  wrow <- function(A, ww) sweep(A, 1, ww, `*`)
+
+  mat1 <- matrix(0, k.i, k.i)
+  if (length(idx1)) {
+    A <- t(ispu[, idx1, drop=FALSE]) / sum11[idx1]
+    A <- wrow(A, w[idx1])
+    mat1 <- mspx[, idx1, drop=FALSE] %*% A
+  }
+
+  mat2 <- matrix(0, k.i, k.i)
+  if (length(idx2)) {
+    A1 <- t(ispv[, idx2, drop=FALSE]) / sum22[idx2]
+    A2 <- t(ispu[, idx2, drop=FALSE]) / sum22[idx2]
+    A  <- wrow(A1 - A2, w[idx2])
+    mat2 <- mspx[, idx2, drop=FALSE] %*% A
+  }
+
+  mat3 <- matrix(0, k.i, k.i)
+  if (length(idx3)) {
+    A1 <- matrix(1, length(idx3), k.i) / sum33[idx3]
+    A2 <- t(ispv[, idx3, drop=FALSE]) / sum33[idx3]
+    A  <- wrow(A1 - A2, w[idx3])
+    mat3 <- mspx[, idx3, drop=FALSE] %*% A
+  }
+
+  mat4 <- matrix(0, k.i, k.i)
+  if (length(idx4)) {
+    B <- t(ispu[, idx4, drop=FALSE]) / sum44[idx4]
+    B <- wrow(B, w[idx4])
+    mat4 <- (matrix(1, k.i, length(idx4)) - ispx[, idx4, drop=FALSE]) %*% B
+  }
+
+  mat5 <- matrix(0, k.i, k.i)
+  if (length(idx5)) {
+    Bv <- t(ispv[, idx5, drop=FALSE]) / sum55[idx5]
+    Bu <- t(ispu[, idx5, drop=FALSE]) / sum55[idx5]
+    B  <- Bv - Bu
+    B  <- wrow(B, w[idx5])
+
+    term1 <- matrix(1, k.i, length(idx5)) %*% B
+    term2 <- - ispx[, idx5, drop=FALSE] %*% wrow(Bv, w[idx5])
+    term3 <- + ispx[, idx5, drop=FALSE] %*% wrow(Bu, w[idx5])
+    mat5 <- term1 + term2 + term3
+  }
+
+  mat6 <- matrix(0, k.i, k.i)
+  if (length(idx6)) {
+    Bv <- t(ispv[, idx6, drop=FALSE]) / sum66[idx6]
+    Bv <- wrow(Bv, w[idx6])
+
+    term1 <- -matrix(1, k.i, length(idx6)) %*% Bv
+    term2 <- -ispx[, idx6, drop=FALSE] %*% wrow(matrix(1, length(idx6), k.i) / sum66[idx6], w[idx6])
+    term3 <- +ispx[, idx6, drop=FALSE] %*% Bv
+    mat6 <- term1 + term2 + term3
+  }
+
+  ddpre[1:sk.i,1] <- matrix(t(mat1 + mat2 + mat3 + mat4 + mat5 + mat6), sk.i, 1)
+
+  vec4 <- matrix(0, 1, k.i)
+  if (length(idx4)) {
+    A <- t(ispu[, idx4, drop=FALSE]) / sum44[idx4]
+    A <- wrow(A, w[idx4])
+    vec4 <- matrix(1,1,length(idx4)) %*% A
+  }
+
+  vec5 <- matrix(0, 1, k.i)
+  if (length(idx5)) {
+    A <- (t(ispv[, idx5, drop=FALSE]) - t(ispu[, idx5, drop=FALSE])) / sum55[idx5]
+    A <- wrow(A, w[idx5])
+    vec5 <- matrix(1,1,length(idx5)) %*% A
+  }
+
+  vec6 <- matrix(0, 1, k.i)
+  if (length(idx6)) {
+    A <- t(ispv[, idx6, drop=FALSE]) / sum66[idx6]
+    A <- wrow(A, w[idx6])
+    vec6 <- -matrix(1,1,length(idx6)) %*% A
+  }
+
+  ddpre[(sk.i+1):(sk.i+k.i), 1] <- vec4 + vec5 + vec6
+
+  vec3 <- matrix(0, k.i, 1)
+  if (length(idx3)) {
+    A <- matrix(1, length(idx3), 1) / sum33[idx3]
+    A <- wrow(A, w[idx3])
+    vec3 <- mspx[, idx3, drop=FALSE] %*% A
+  }
+
+  vec6b <- matrix(0, k.i, 1)
+  if (length(idx6)) {
+    A <- matrix(1, length(idx6), 1) / sum66[idx6]
+    A <- wrow(A, w[idx6])
+    vec6b <- -ispx[, idx6, drop=FALSE] %*% A
+  }
+
+  ddpre[(sk.i+k.i+1):(sk.i+2*k.i), 1] <- vec3 + vec6b
+  ddpre
+}
+
+hh_pre_w <- function(data1,data2,data3,data4,data5,data6,
+                     sum11,sum22,sum33,sum44,sum55,sum66,
+                     mat11,mat22,mat33,mat44,mat55,mat66,
+                     vec44,vec55,vec66,vec33,vec66new,
+                     w)
+{
+  hhpre <- matrix(0, (sk.i+2*k.i), (sk.i+2*k.i))
+
+  idx1 <- which(data1 != 0); idx2 <- which(data2 != 0); idx3 <- which(data3 != 0)
+  idx4 <- which(data4 != 0); idx5 <- which(data5 != 0); idx6 <- which(data6 != 0)
+
+  wrow <- function(A, ww) sweep(A, 1, ww, `*`)
+
+  mat111 <- matrix(0, sk.i, sk.i)
+  if (length(idx1)) {
+    A <- t(mat11) / (sum11[idx1]^2)
+    A <- wrow(A, w[idx1])
+    mat111 <- mat11 %*% A
+  }
+
+  mat222 <- matrix(0, sk.i, sk.i)
+  if (length(idx2)) {
+    A <- t(mat22) / (sum22[idx2]^2)
+    A <- wrow(A, w[idx2])
+    mat222 <- mat22 %*% A
+  }
+
+  mat333 <- matrix(0, sk.i, sk.i)
+  if (length(idx3)) {
+    A <- t(mat33) / (sum33[idx3]^2)
+    A <- wrow(A, w[idx3])
+    mat333 <- mat33 %*% A
+  }
+
+  mat444 <- matrix(0, sk.i, sk.i)
+  if (length(idx4)) {
+    A <- t(mat44) / (sum44[idx4]^2)
+    A <- wrow(A, w[idx4])
+    mat444 <- mat44 %*% A
+  }
+
+  mat555 <- matrix(0, sk.i, sk.i)
+  if (length(idx5)) {
+    A <- t(mat55) / (sum55[idx5]^2)
+    A <- wrow(A, w[idx5])
+    mat555 <- mat55 %*% A
+  }
+
+  mat666 <- matrix(0, sk.i, sk.i)
+  if (length(idx6)) {
+    A <- t(mat66) / (sum66[idx6]^2)
+    A <- wrow(A, w[idx6])
+    mat666 <- mat66 %*% A
+  }
+
+  hhpre[1:sk.i, 1:sk.i] <- -mat111 - mat222 - mat333 - mat444 - mat555 - mat666
+
+  vec444 <- matrix(0, sk.i, k.i)
+  if (length(idx4)) {
+    A <- t(vec44) / (sum44[idx4]^2)
+    A <- wrow(A, w[idx4])
+    vec444 <- mat44 %*% A
+  }
+
+  vec555 <- matrix(0, sk.i, k.i)
+  if (length(idx5)) {
+    A <- t(vec55) / (sum55[idx5]^2)
+    A <- wrow(A, w[idx5])
+    vec555 <- mat55 %*% A
+  }
+
+  vec666 <- matrix(0, sk.i, k.i)
+  if (length(idx6)) {
+    A <- t(vec66) / (sum66[idx6]^2)
+    A <- wrow(A, w[idx6])
+    vec666 <- mat66 %*% A
+  }
+
+  hhpre[1:sk.i, (sk.i+1):(sk.i+k.i)] <- -vec444 - vec555 - vec666
+
+  vec333 <- matrix(0, sk.i, k.i)
+  if (length(idx3)) {
+    A <- t(vec33) / (sum33[idx3]^2)
+    A <- wrow(A, w[idx3])
+    vec333 <- mat33 %*% A
+  }
+
+  vec666b <- matrix(0, sk.i, k.i)
+  if (length(idx6)) {
+    A <- t(vec66new) / (sum66[idx6]^2)
+    A <- wrow(A, w[idx6])
+    vec666b <- mat66 %*% A
+  }
+
+  hhpre[1:sk.i, (sk.i+k.i+1):(sk.i+2*k.i)] <- -vec333 - vec666b
+
+  vec4442 <- matrix(0, k.i, k.i)
+  if (length(idx4)) {
+    A <- t(vec44) / (sum44[idx4]^2)
+    A <- wrow(A, w[idx4])
+    vec4442 <- vec44 %*% A
+  }
+
+  vec5552 <- matrix(0, k.i, k.i)
+  if (length(idx5)) {
+    A <- t(vec55) / (sum55[idx5]^2)
+    A <- wrow(A, w[idx5])
+    vec5552 <- vec55 %*% A
+  }
+
+  vec6662 <- matrix(0, k.i, k.i)
+  if (length(idx6)) {
+    A <- t(vec66) / (sum66[idx6]^2)
+    A <- wrow(A, w[idx6])
+    vec6662 <- vec66 %*% A
+  }
+
+  hhpre[(sk.i+1):(sk.i+k.i), (sk.i+1):(sk.i+k.i)] <- -vec4442 - vec5552 - vec6662
+
+  vec6663 <- matrix(0, k.i, k.i)
+  if (length(idx6)) {
+    A <- t(vec66new) / (sum66[idx6]^2)
+    A <- wrow(A, w[idx6])
+    vec6663 <- vec66 %*% A
+  }
+  hhpre[(sk.i+1):(sk.i+k.i), (sk.i+k.i+1):(sk.i+2*k.i)] <- -vec6663
+
+  vec3333 <- matrix(0, k.i, k.i)
+  if (length(idx3)) {
+    A <- t(vec33) / (sum33[idx3]^2)
+    A <- wrow(A, w[idx3])
+    vec3333 <- vec33 %*% A
+  }
+
+  vec6664 <- matrix(0, k.i, k.i)
+  if (length(idx6)) {
+    A <- t(vec66new) / (sum66[idx6]^2)
+    A <- wrow(A, w[idx6])
+    vec6664 <- vec66new %*% A
+  }
+
+  hhpre[(sk.i+k.i+1):(sk.i+2*k.i), (sk.i+k.i+1):(sk.i+2*k.i)] <- -vec3333 - vec6664
+
+  hhpre[(sk.i+1):(sk.i+k.i), 1:sk.i] <- t(hhpre[1:sk.i, (sk.i+1):(sk.i+k.i)])
+  hhpre[(sk.i+k.i+1):(sk.i+2*k.i), 1:sk.i] <- t(hhpre[1:sk.i, (sk.i+k.i+1):(sk.i+2*k.i)])
+  hhpre[(sk.i+k.i+1):(sk.i+2*k.i), (sk.i+1):(sk.i+k.i)] <- t(hhpre[(sk.i+1):(sk.i+k.i), (sk.i+k.i+1):(sk.i+2*k.i)])
+  hhpre
+}
+
+## VISIT PROCESS + EVENT/CENSORING DATA GENERATION
+
+## Eight subject-specific inspections, bounded away from time zero.
+## Nominal schedule: 0.10, 0.80, 1.50, 2.20, 2.90, 3.60, 4.30, 5.00.
+## Independent U(-0.05, 0.05) jitter at each visit.
+## The first actual inspection thus has population support [0.05, 0.15].
+## Yuan Wu. In particular, no actual inspection occurs before tau_lower.
+nominal_visits <- c(0.10, 0.80, 1.50, 2.20,
+                    2.90, 3.60, 4.30, 5.00)
+visit_jitter <- 0.05
+
+## For the secondary interval-censored endpoint, integrate over [0.05, 5].
+## tau_lower equals the lower support boundary for the first actual visit.
+## The exact/right-censored primary contribution still integrates over [0, 5].
+## The untrimmed secondary [0, 5] computation, if retained, is exploratory:
+## its behavior below 0.05 is not justified by the stated theorem.
+tau_lower <- 0.05
+stopifnot(length(nominal_visits) == 8L,
+          all(diff(nominal_visits) > 2 * visit_jitter),
+          abs(nominal_visits[1L] - visit_jitter - tau_lower) < 1e-12,
+          tau_lower > 0, tau_lower < tau)
+
+make_subject_visits <- function(n,
+                                visit_centers = nominal_visits,
+                                jitter = visit_jitter) {
+  stopifnot(n >= 1L, length(visit_centers) >= 2L,
+            all(diff(visit_centers) > 2*jitter),
+            visit_centers[1L] - jitter >= tau_lower - 1e-12)
+  visits_list <- vector("list", n)
+  for (i in seq_len(n)) {
+    v <- visit_centers + runif(length(visit_centers), -jitter, jitter)
+    ## Strict order follows from separation of nominal inspection times.
+    ## The first visit must be bounded below by tau_lower.
+    stopifnot(all(diff(v) > 0), v[1L] >= tau_lower - 1e-12)
+    visits_list[[i]] <- v
+  }
+  visits_list
+}
+
+get_time <- function(theta, lambda0, nu0, size)
+{
+  cc <- copula::gumbelCopula(param = theta, dim = 2)
+  v  <- copula::rCopula(size, cc)
+  x1 <- qexp(v[,1], rate = lambda0)
+  x2 <- qexp(v[,2], rate = nu0)
+  list(x1=x1, x2=x2)
+}
+
+from.event.to.censor <- function(size, x1, x2, visits_list)
+{
+  delta1_1 <- rep(0, size)
+  delta2_1 <- rep(0, size)
+
+  delta1_2 <- rep(0, size)
+  delta2_2 <- rep(0, size)
+  delta3_2 <- rep(0, size)
+
+  ## Primary: independent right censoring.
+  ct <- rexp(size, rate = censor_rate_primary)
+
+  delta1_1[x1 <= ct] <- 1
+  delta2_1[x1 >  ct] <- 1
+
+  ## x1 becomes the observed primary time: event time or censoring time.
+  x1[delta2_1 == 1] <- ct[delta2_1 == 1]
+
+  ## Secondary interval censoring using the two subject-specific visits.
+  ctu <- rep(0, size)
+  ctv <- rep(0, size)
+
+  for (k in seq_len(size))
+  {
+    visits <- visits_list[[k]]
+    n.visits <- length(visits)
+
+    if (x2[k] > visits[n.visits]) {
+      ctu[k] <- visits[n.visits - 1L]
+      ctv[k] <- visits[n.visits]
+      delta1_2[k] <- 0
+      delta2_2[k] <- 0
+      delta3_2[k] <- 1
+
+    } else if (x2[k] < visits[1]) {
+      ctu[k] <- visits[1]
+      ctv[k] <- visits[2]
+      delta1_2[k] <- 1
+      delta2_2[k] <- 0
+      delta3_2[k] <- 0
+
+    } else {
+      jj <- length(visits[visits < x2[k]])
+      ctu[k] <- visits[jj]
+      ctv[k] <- visits[jj + 1L]
+      delta1_2[k] <- 0
+      delta2_2[k] <- 1
+      delta3_2[k] <- 0
+    }
+  }
+
+  ## ORIGINAL terminal/follow-up recoding rules.
+  for (k in seq_len(size)) {
+
+    if (delta1_2[k] == 1 && x1[k] < ctu[k]) {
+
+      delta1_2[k] <- 0
+      delta2_2[k] <- 0
+      delta3_2[k] <- 1
+      ctv[k] <- 0
+      ctu[k] <- ctv[k]
+
+    } else if (delta2_2[k] == 1 && x1[k] < ctu[k]) {
+
+      delta1_2[k] <- 0
+      delta2_2[k] <- 0
+      delta3_2[k] <- 1
+
+      visits <- visits_list[[k]]
+      before_x1 <- visits[visits < x1[k]]
+      ctv[k] <- if (length(before_x1) > 0) max(before_x1) else 0
+      ctu[k] <- ctv[k]
+
+    } else if (delta2_2[k] == 1 &&
+               x1[k] >= ctu[k] &&
+               x1[k] < ctv[k]) {
+
+      delta1_2[k] <- 0
+      delta2_2[k] <- 0
+      delta3_2[k] <- 1
+      ctv[k] <- ctu[k]
+      ctu[k] <- ctv[k]
+
+    } else if (delta3_2[k] == 1 && x1[k] < ctv[k]) {
+
+      delta1_2[k] <- 0
+      delta2_2[k] <- 0
+      delta3_2[k] <- 1
+
+      visits <- visits_list[[k]]
+      before_x1 <- visits[visits < x1[k]]
+      ctv[k] <- if (length(before_x1) > 0) max(before_x1) else 0
+      ctu[k] <- ctv[k]
+    }
+  }
+
+  list(
+    x1 = x1,
+    ctu = ctu,
+    ctv = ctv,
+    first_visit = vapply(visits_list, function(v) v[1], numeric(1)),
+    delta1_1 = delta1_1,
+    delta2_1 = delta2_1,
+    delta1_2 = delta1_2,
+    delta2_2 = delta2_2,
+    delta3_2 = delta3_2
+  )
+}
+
+# Spline knots
+## with revision-era numerical safeguards
+
+get_knots <- function(x1, ctu, ctv)
+{
+  probs <- seq_len(k.i - 3L) / (k.i - 2L)
+
+  q1 <- as.numeric(
+    quantile(x1, probs = probs, names = FALSE)
+  )
+
+  ## ctu=ctv=0 is used by the ORIGINAL terminal-event recoding
+  ## when follow-up ends before the first secondary assessment.
+  ## Zero is the boundary, not an interior inspection time, so exclude
+  ## these artificial zeros when choosing secondary interior knots.
+  knot_pre_2 <- c(ctu, ctv)
+  knot_pre_2 <- knot_pre_2[is.finite(knot_pre_2) & knot_pre_2 > 0]
+
+  if (length(knot_pre_2) < (k.i - 3L)) {
+    stop("Too few positive secondary inspection endpoints for knot placement")
+  }
+
+  q2 <- as.numeric(
+    quantile(knot_pre_2, probs = probs, names = FALSE)
+  )
+
+  ## Cover every finite likelihood-evaluation time and tau.
+  qmax1 <- max(c(x1, tau), na.rm = TRUE) + 0.5
+  qmax2 <- max(c(ctu, ctv, tau), na.rm = TRUE) + 0.5
+
+  knot1 <- c(
+    rep(0, spline.ord),
+    q1,
+    rep(qmax1, spline.ord)
+  )
+
+  knot2 <- c(
+    rep(0, spline.ord),
+    q2,
+    rep(qmax2, spline.ord)
+  )
+
+  stopifnot(
+    length(knot1) == n.spline + spline.ord + 1L,
+    length(knot2) == n.spline + spline.ord + 1L
+  )
+
+  list(knot1 = knot1, knot2 = knot2)
+}
+
+totest_fast_diag <- function(x1, ctu, ctv,
+                        delta1_1, delta2_1,
+                        delta1_2, delta2_2, delta3_2,
+                        w = rep(1, length(x1)),
+                        alpha_init = NULL,
+                        max_halvings = 10L)
+{
+  knot12 <- get_knots(x1, ctu, ctv)
+  knot1 <- knot12$knot1
+  knot2 <- knot12$knot2
+
+  ## I-spline / M-spline for primary margin.
+  knotb <- knot1
+  ord <- spline.ord
+
+  bspx <- t(
+    splineDesign(
+      knots = knotb,
+      x = x1,
+      ord = ord,
+      outer.ok = TRUE
+    )
+  )
+
+  pre.ispx <- apply(bspx, 2, rev)
+  ispx <- apply(pre.ispx, 2, cumsum)
+  ispx <- apply(ispx, 2, rev)
+  ispx <- ispx[-1, , drop = FALSE]
+
+  knotbM <- knot1[-c(1, n.spline + spline.ord + 1L)]
+  ordM <- spline.ord - 1L
+
+  bspxM <- t(
+    splineDesign(
+      knots = knotbM,
+      x = x1,
+      ord = ordM,
+      outer.ok = TRUE
+    )
+  )
+
+  mspx <- bspxM /
+    (knotbM[(1 + ordM):(n.spline + ordM)] -
+       knotbM[1:n.spline]) * ordM
+
+  ## I-spline for secondary margin at lower/upper endpoints.
+  knotb <- knot2
+  ord <- spline.ord
+
+  bspu <- t(
+    splineDesign(
+      knots = knotb,
+      x = ctu,
+      ord = ord,
+      outer.ok = TRUE
+    )
+  )
+
+  pre.ispu <- apply(bspu, 2, rev)
+  ispu <- apply(pre.ispu, 2, cumsum)
+  ispu <- apply(ispu, 2, rev)
+  ispu <- ispu[-1, , drop = FALSE]
+
+  bspv <- t(
+    splineDesign(
+      knots = knotb,
+      x = ctv,
+      ord = ord,
+      outer.ok = TRUE
+    )
+  )
+
+  pre.ispv <- apply(bspv, 2, rev)
+  ispv <- apply(pre.ispv, 2, cumsum)
+  ispv <- apply(ispv, 2, rev)
+  ispv <- ispv[-1, , drop = FALSE]
+
+  ## ORIGINAL six observed-data categories.
+  data1 <- delta1_1 * delta1_2
+  data2 <- delta1_1 * delta2_2
+  data3 <- delta1_1 * delta3_2
+  data4 <- delta2_1 * delta1_2
+  data5 <- delta2_1 * delta2_2
+  data6 <- delta2_1 * delta3_2
+
+  noze1 <- sum(data1)
+  noze2 <- sum(data2)
+  noze3 <- sum(data3)
+  noze4 <- sum(data4)
+  noze5 <- sum(data5)
+  noze6 <- sum(data6)
+
+  ## ORIGINAL derivative-design arrays.
+  mat11 <- matrix(0, 1, noze1)
+  mat22 <- matrix(0, 1, noze2)
+  mat33 <- matrix(0, 1, noze3)
+  mat44 <- matrix(0, 1, noze4)
+  mat55 <- matrix(0, 1, noze5)
+  mat66 <- matrix(0, 1, noze6)
+
+  for (m in seq_len(k.i))
+  {
+    mat11 <- rbind(
+      mat11,
+      t(c(mspx[m, data1 != 0]) *
+          t(ispu[, data1 != 0, drop = FALSE]))
+    )
+
+    mat22 <- rbind(
+      mat22,
+      t(c(mspx[m, data2 != 0]) *
+          t(ispv[, data2 != 0, drop = FALSE])) -
+        t(c(mspx[m, data2 != 0]) *
+            t(ispu[, data2 != 0, drop = FALSE]))
+    )
+
+    mat33 <- rbind(
+      mat33,
+      t(c(mspx[m, data3 != 0]) *
+          matrix(1, noze3, k.i)) -
+        t(c(mspx[m, data3 != 0]) *
+            t(ispv[, data3 != 0, drop = FALSE]))
+    )
+
+    mat44 <- rbind(
+      mat44,
+      ispu[, data4 != 0, drop = FALSE] -
+        t(c(ispx[m, data4 != 0]) *
+            t(ispu[, data4 != 0, drop = FALSE]))
+    )
+
+    mat55 <- rbind(
+      mat55,
+      ispv[, data5 != 0, drop = FALSE] -
+        ispu[, data5 != 0, drop = FALSE] -
+        t(c(ispx[m, data5 != 0]) *
+            t(ispv[, data5 != 0, drop = FALSE])) +
+        t(c(ispx[m, data5 != 0]) *
+            t(ispu[, data5 != 0, drop = FALSE]))
+    )
+
+    mat66 <- rbind(
+      mat66,
+      -ispv[, data6 != 0, drop = FALSE] -
+        t(c(ispx[m, data6 != 0]) *
+            matrix(1, noze6, k.i)) +
+        t(c(ispx[m, data6 != 0]) *
+            t(ispv[, data6 != 0, drop = FALSE]))
+    )
+  }
+
+  mat11 <- mat11[-1, , drop = FALSE]
+  mat22 <- mat22[-1, , drop = FALSE]
+  mat33 <- mat33[-1, , drop = FALSE]
+  mat44 <- mat44[-1, , drop = FALSE]
+  mat55 <- mat55[-1, , drop = FALSE]
+  mat66 <- mat66[-1, , drop = FALSE]
+
+  vec44 <- ispu[, data4 != 0, drop = FALSE]
+  vec55 <- ispv[, data5 != 0, drop = FALSE] -
+    ispu[, data5 != 0, drop = FALSE]
+  vec66 <- -ispv[, data6 != 0, drop = FALSE]
+  vec33 <- mspx[, data3 != 0, drop = FALSE]
+  vec66new <- -ispx[, data6 != 0, drop = FALSE]
+
+  ## Start.
+  if (is.null(alpha_init)) {
+    alpha <- matrix(0.5 / p_alpha, p_alpha, 1)
+  } else {
+    avec <- as.numeric(alpha_init)
+
+    if (length(avec) != p_alpha || any(!is.finite(avec))) {
+      stop("Invalid alpha_init")
+    }
+
+    alpha <- matrix(avec, p_alpha, 1)
+    alpha[alpha < 0] <- 0
+
+    if (sum(alpha) >= 1) {
+      alpha <- alpha / sum(alpha) * (1 - 1e-10)
+    }
+  }
+
+  current_parts <- sumvectorfunction(
+    alpha, ispx, mspx, ispu, ispv
+  )
+
+  sum11 <- current_parts$sum11
+  sum22 <- current_parts$sum22
+  sum33 <- current_parts$sum33
+  sum44 <- current_parts$sum44
+  sum55 <- current_parts$sum55
+  sum66 <- current_parts$sum66
+
+  summl1 <- sumfunction_w(
+    sum11, sum22, sum33, sum44, sum55, sum66,
+    data1, data2, data3, data4, data5, data6,
+    w
+  )
+
+  if (!is.finite(summl1)) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = "invalid_start_likelihood",
+      detail = "Initial observed-cell probability nonpositive/nonfinite"
+    ))
+  }
+
+  dd <- gg_pre_w(
+    ispx, mspx, ispu, ispv,
+    data1, data2, data3, data4, data5, data6,
+    noze1, noze2, noze3, noze4, noze5, noze6,
+    sum11, sum22, sum33, sum44, sum55, sum66,
+    w
+  )
+
+  hhh <- hh_pre_w(
+    data1, data2, data3, data4, data5, data6,
+    sum11, sum22, sum33, sum44, sum55, sum66,
+    mat11, mat22, mat33, mat44, mat55, mat66,
+    vec44, vec55, vec66, vec33, vec66new,
+    w
+  )
+
+  ## Generalized gradient-projection algorithm:
+  ## conditioning / active-set / line-search safeguards.
+  indexA <- integer(0)
+  aa <- NULL
+
+  row_old <- -1L
+  row_now <- 0L
+  first_pass <- TRUE
+
+  stopflag <- FALSE
+  fail_reason <- "success"
+  fail_detail <- NA_character_
+
+  while (row_old != row_now)
+  {
+    if (first_pass)
+    {
+      first_pass <- FALSE
+
+      hreg <- -hhh + diag(0.01, p_alpha)
+      rc <- rcond(hreg)
+
+      if (!is.finite(rc) || rc < 1e-15) {
+        fail_reason <- "hessian_ill_conditioned"
+        fail_detail <- paste0("initial rcond=", rc)
+        stopflag <- TRUE
+        break
+      }
+
+      ww <- solve(hreg)
+      gt <- ww %*% dd
+
+      row_now <- 0L
+      pw <- diag(1, p_alpha)
+      ddd <- pw %*% gt
+      ddd[abs(ddd) < 2e-8] <- 0
+
+    } else {
+
+      if (row_now > 0L) {
+        amat <- aa %*% ww %*% t(aa)
+        rc <- rcond(amat)
+
+        if (!is.finite(rc) || rc < 1e-15) {
+          fail_reason <- "active_set_ill_conditioned"
+          fail_detail <- paste0("rcond=", rc)
+          stopflag <- TRUE
+          break
+        }
+
+        pw <- diag(1, p_alpha) -
+          ww %*% t(aa) %*% solve(amat) %*% aa
+
+      } else {
+        pw <- diag(1, p_alpha)
+      }
+
+      ddd <- pw %*% gt
+      ddd[abs(ddd) < 2e-8] <- 0
+    }
+
+    inner_iter <- 0L
+
+    while (max(abs(ddd)) > 1e-4)
+    {
+      inner_iter <- inner_iter + 1L
+
+      if (inner_iter > 10000L) {
+        fail_reason <- "iteration_limit"
+        fail_detail <- "Exceeded 10000 inner iterations"
+        stopflag <- TRUE
+        break
+      }
+
+      tep <- numeric(0)
+      tep1 <- integer(0)
+
+      sumc <- sum(alpha)
+      sumd <- sum(ddd)
+
+      if ((1 - sumc) > 1e-7 && sumd > 1e-7) {
+        tep <- c(tep, (1 - sumc) / sumd)
+        tep1 <- c(tep1, -1L)
+      }
+
+      ## Joint coefficients use original 1e-7 numerical boundary.
+      for (ii in seq_len(sk.i)) {
+        if (alpha[ii] > 1e-7 && ddd[ii] < 0) {
+          tep <- c(tep, (1e-7 - alpha[ii]) / ddd[ii])
+          tep1 <- c(tep1, ii)
+        }
+      }
+
+      ## Marginal coefficients use zero boundary.
+      for (ii in (sk.i + 1L):p_alpha) {
+        if (alpha[ii] > 0 && ddd[ii] < 0) {
+          tep <- c(tep, -alpha[ii] / ddd[ii])
+          tep1 <- c(tep1, ii)
+        }
+      }
+
+      if (length(tep) > 0L) {
+        kkkk <- which.min(tep)
+        raw_step <- tep[kkkk]
+        boundary_id <- tep1[kkkk]
+      } else {
+        kkkk <- NA_integer_
+        raw_step <- Inf
+        boundary_id <- NA_integer_
+      }
+
+      rrtt <- min(raw_step, 0.5)
+      hit_boundary <- is.finite(raw_step) && raw_step <= 0.5
+
+      summl2 <- summl1 - 1
+      kk <- -1L
+      alphat <- alpha
+
+      while (summl2 <= summl1 && kk <= max_halvings)
+      {
+        kk <- kk + 1L
+        alphat <- alpha + (0.5^kk) * rrtt * ddd
+
+        if (sum(alphat) > 1 + 1e-5) {
+          ## Invalid trial step: reject it and continue halving.
+          ## This is a line-search event, not a dataset-level fit failure.
+          summl2 <- -Inf
+          next
+        }
+
+        add <- integer(0)
+
+        if (hit_boundary && kk == 0L)
+        {
+          if (boundary_id != -1L) {
+            if (boundary_id > sk.i) {
+              alphat[boundary_id] <- 0
+            } else {
+              alphat[boundary_id] <- 1e-7
+            }
+          }
+
+          for (ii in seq_len(p_alpha))
+          {
+            near_boundary <-
+              (ii <= sk.i &&
+                 abs(alphat[ii] - 1e-7) < 1e-8) ||
+              (ii > sk.i && alphat[ii] < 1e-8)
+
+            if (near_boundary &&
+                ii != boundary_id &&
+                !(ii %in% indexA)) {
+              add <- c(add, ii)
+            }
+          }
+        }
+
+        alphat[alphat < 1e-8] <- 0
+
+        trial_parts <- sumvectorfunction(
+          alphat, ispx, mspx, ispu, ispv
+        )
+
+        summl2 <- sumfunction_w(
+          trial_parts$sum11,
+          trial_parts$sum22,
+          trial_parts$sum33,
+          trial_parts$sum44,
+          trial_parts$sum55,
+          trial_parts$sum66,
+          data1, data2, data3, data4, data5, data6,
+          w
+        )
+
+        if (is.infinite(summl2) && summl2 > 0) {
+          fail_reason <- "trial_loglik_posInf"
+          fail_detail <- "Trial log-likelihood was +Inf"
+          stopflag <- TRUE
+          break
+        }
+      }
+
+      if (stopflag) break
+
+      if (kk > max_halvings) {
+        fail_reason <- "line_search_failure"
+        fail_detail <- paste0(
+          "No likelihood increase after >",
+          max_halvings,
+          " step halvings"
+        )
+        stopflag <- TRUE
+        break
+      }
+
+      if (hit_boundary && kk == 0L)
+      {
+        if (boundary_id == -1L) {
+          if (!(-1L %in% indexA)) {
+            anew <- matrix(1, 1, p_alpha)
+            indexA <- c(indexA, -1L)
+            aa <- if (is.null(aa)) anew else rbind(aa, anew)
+          }
+        } else {
+          if (!(boundary_id %in% indexA)) {
+            anew <- matrix(0, 1, p_alpha)
+            anew[1, boundary_id] <- -1
+            indexA <- c(indexA, boundary_id)
+            aa <- if (is.null(aa)) anew else rbind(aa, anew)
+          }
+        }
+
+        if (length(add) > 0L) {
+          for (jj in add) {
+            if (!(jj %in% indexA)) {
+              anew <- matrix(0, 1, p_alpha)
+              anew[1, jj] <- -1
+              indexA <- c(indexA, jj)
+              aa <- if (is.null(aa)) anew else rbind(aa, anew)
+            }
+          }
+        }
+
+        row_now <- length(indexA)
+      }
+
+      alpha <- alphat
+
+      current_parts <- sumvectorfunction(
+        alpha, ispx, mspx, ispu, ispv
+      )
+
+      sum11 <- current_parts$sum11
+      sum22 <- current_parts$sum22
+      sum33 <- current_parts$sum33
+      sum44 <- current_parts$sum44
+      sum55 <- current_parts$sum55
+      sum66 <- current_parts$sum66
+
+      summl1 <- sumfunction_w(
+        sum11, sum22, sum33, sum44, sum55, sum66,
+        data1, data2, data3, data4, data5, data6,
+        w
+      )
+
+      if (!is.finite(summl1)) {
+        fail_reason <- "invalid_updated_likelihood"
+        fail_detail <- "Accepted point has invalid likelihood"
+        stopflag <- TRUE
+        break
+      }
+
+      dd <- gg_pre_w(
+        ispx, mspx, ispu, ispv,
+        data1, data2, data3, data4, data5, data6,
+        noze1, noze2, noze3, noze4, noze5, noze6,
+        sum11, sum22, sum33, sum44, sum55, sum66,
+        w
+      )
+
+      hhh <- hh_pre_w(
+        data1, data2, data3, data4, data5, data6,
+        sum11, sum22, sum33, sum44, sum55, sum66,
+        mat11, mat22, mat33, mat44, mat55, mat66,
+        vec44, vec55, vec66, vec33, vec66new,
+        w
+      )
+
+      hreg <- -hhh + diag(0.01, p_alpha)
+      rc <- rcond(hreg)
+
+      if (!is.finite(rc) || rc < 1e-15) {
+        fail_reason <- "hessian_ill_conditioned"
+        fail_detail <- paste0("rcond=", rc)
+        stopflag <- TRUE
+        break
+      }
+
+      ww <- solve(hreg)
+      gt <- ww %*% dd
+
+      if (row_now > 0L) {
+        amat <- aa %*% ww %*% t(aa)
+        rc <- rcond(amat)
+
+        if (!is.finite(rc) || rc < 1e-15) {
+          fail_reason <- "active_set_ill_conditioned"
+          fail_detail <- paste0("rcond=", rc)
+          stopflag <- TRUE
+          break
+        }
+
+        pw <- diag(1, p_alpha) -
+          ww %*% t(aa) %*% solve(amat) %*% aa
+      } else {
+        pw <- diag(1, p_alpha)
+      }
+
+      ddd <- pw %*% gt
+      ddd[abs(ddd) < 2e-8] <- 0
+    }
+
+    if (stopflag) break
+
+    row_old <- row_now
+
+    if (row_now > 0L)
+    {
+      amat <- aa %*% ww %*% t(aa)
+      rc <- rcond(amat)
+
+      if (!is.finite(rc) || rc < 1e-15) {
+        fail_reason <- "active_set_ill_conditioned"
+        fail_detail <- paste0("rcond=", rc)
+        stopflag <- TRUE
+        break
+      }
+
+      lambda <- solve(amat) %*% aa %*% gt
+
+      if (min(lambda) < 0)
+      {
+        ik <- which.min(lambda)
+
+        indexA <- indexA[-ik]
+
+        if (length(indexA) == 0L) {
+          aa <- NULL
+        } else {
+          aa <- aa[-ik, , drop = FALSE]
+        }
+
+        row_now <- length(indexA)
+      }
+    }
+  }
+
+  if (!stopflag) {
+    list(
+      alpha = alpha,
+      knot1 = knot1,
+      knot2 = knot2,
+      status = "success",
+      detail = NA_character_
+    )
+  } else {
+    list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = fail_reason,
+      detail = fail_detail
+    )
+  }
+}
+
+validate_fit <- function(ans, tol = 1e-7)
+{
+  if (is.null(ans$status)) {
+    ans$status <- "invalid_fit_object"
+    ans$detail <- "Missing status"
+    return(ans)
+  }
+
+  if (!identical(ans$status, "success")) return(ans)
+
+  a <- as.numeric(ans$alpha)
+
+  if (length(a) != p_alpha || any(!is.finite(a))) {
+    ans$status <- "invalid_coefficient_vector"
+    ans$detail <- "Wrong length/nonfinite coefficient"
+    return(ans)
+  }
+
+  if (any(a < -tol)) {
+    ans$status <- "nonnegativity_constraint_failure"
+    ans$detail <- paste0("min(alpha)=", min(a))
+    return(ans)
+  }
+
+  if (sum(a) > 1 + tol) {
+    ans$status <- "mass_constraint_failure"
+    ans$detail <- paste0("sum(alpha)=", sum(a))
+    return(ans)
+  }
+
+  if (any(!is.finite(ans$knot1)) ||
+      any(!is.finite(ans$knot2))) {
+    ans$status <- "invalid_knot_vector"
+    ans$detail <- "Nonfinite knot"
+    return(ans)
+  }
+
+  ans
+}
+
+## Softmax/BFGS fallback
+##
+## Reparameterization:
+##   alpha_j = lower_j + R * q_j(eta),
+## where q_1,...,q_p,q_slack are a (p+1)-category softmax,
+## q_slack has fixed logit 0, and
+##   R = 1 - sum(lower).
+##
+## Hence the coefficient constraints hold automatically:
+##   joint alpha_jk > 1e-7,
+##   marginal coefficients > 0,
+##   sum(alpha) < 1.
+##
+## The strict inequalities only provide an arbitrarily small numerical
+## interior approximation to boundary solutions; the statistical
+## likelihood itself is unchanged.
+
+softmax_alpha_from_eta <- function(eta)
+{
+  eta <- as.numeric(eta)
+
+  if (length(eta) != p_alpha || any(!is.finite(eta))) {
+    stop("Invalid eta")
+  }
+
+  lower <- c(
+    rep(1e-7, sk.i),
+    rep(0, 2L*k.i)
+  )
+
+  R <- 1 - sum(lower)
+
+  ## Stable softmax over c(eta, 0), where the last category is unused mass.
+  shift <- max(c(eta, 0))
+  ee <- exp(eta - shift)
+  e0 <- exp(-shift)
+  den <- sum(ee) + e0
+
+  q <- ee / den
+  q0 <- e0 / den
+
+  alpha <- lower + R * q
+
+  list(
+    alpha = alpha,
+    q = q,
+    q0 = q0,
+    lower = lower,
+    R = R
+  )
+}
+
+softmax_eta_from_alpha <- function(alpha_init = NULL,
+                                   interior_mix = 1e-6)
+{
+  lower <- c(
+    rep(1e-7, sk.i),
+    rep(0, 2L*k.i)
+  )
+
+  R <- 1 - sum(lower)
+
+  if (is.null(alpha_init)) {
+    ## Generic strictly interior alpha start with total mass 0.50.
+    a <- rep(0.5 / p_alpha, p_alpha)
+  } else {
+    a <- as.numeric(alpha_init)
+
+    if (length(a) != p_alpha || any(!is.finite(a))) {
+      stop("Invalid alpha_init")
+    }
+
+    a <- pmax(a, lower)
+  }
+
+  ## If numerical rounding puts the start too close to / beyond total mass 1,
+  if (sum(a) >= 0.999999) {
+    free <- pmax(a - lower, 0)
+    target_free <- 0.95 - sum(lower)
+
+    if (sum(free) > 0) {
+      a <- lower + free / sum(free) * target_free
+    } else {
+      a <- lower + target_free / p_alpha
+    }
+  }
+
+  free <- pmax(a - lower, 0)
+  slack <- 1 - sum(a)
+
+  q_full <- c(free / R, slack / R)
+
+  ## Protect the inverse logit from exact zeros.  This changes only the
+  ## numerical starting value, not the likelihood being optimized.
+  eps <- interior_mix
+  q_full <- (1 - eps) * q_full +
+    eps * rep(1 / (p_alpha + 1L), p_alpha + 1L)
+
+  q_full <- q_full / sum(q_full)
+
+  log(q_full[seq_len(p_alpha)] / q_full[p_alpha + 1L])
+}
+
+totest_bfgs_diag <- function(x1, ctu, ctv,
+                             delta1_1, delta2_1,
+                             delta1_2, delta2_2, delta3_2,
+                             w = rep(1, length(x1)),
+                             alpha_init = NULL,
+                             maxit = 300L,
+                             reltol = 1e-8)
+{
+  knot12 <- get_knots(x1, ctu, ctv)
+  knot1 <- knot12$knot1
+  knot2 <- knot12$knot2
+
+  ## Same I-spline / M-spline basis construction as the original estimator.
+  knotb <- knot1
+  ord <- spline.ord
+
+  bspx <- t(
+    splineDesign(
+      knots = knotb,
+      x = x1,
+      ord = ord,
+      outer.ok = TRUE
+    )
+  )
+
+  pre.ispx <- apply(bspx, 2, rev)
+  ispx <- apply(pre.ispx, 2, cumsum)
+  ispx <- apply(ispx, 2, rev)
+  ispx <- ispx[-1, , drop = FALSE]
+
+  knotbM <- knot1[-c(1, n.spline + spline.ord + 1L)]
+  ordM <- spline.ord - 1L
+
+  bspxM <- t(
+    splineDesign(
+      knots = knotbM,
+      x = x1,
+      ord = ordM,
+      outer.ok = TRUE
+    )
+  )
+
+  mspx <- bspxM /
+    (knotbM[(1 + ordM):(n.spline + ordM)] -
+       knotbM[1:n.spline]) * ordM
+
+  knotb <- knot2
+  ord <- spline.ord
+
+  bspu <- t(
+    splineDesign(
+      knots = knotb,
+      x = ctu,
+      ord = ord,
+      outer.ok = TRUE
+    )
+  )
+
+  pre.ispu <- apply(bspu, 2, rev)
+  ispu <- apply(pre.ispu, 2, cumsum)
+  ispu <- apply(ispu, 2, rev)
+  ispu <- ispu[-1, , drop = FALSE]
+
+  bspv <- t(
+    splineDesign(
+      knots = knotb,
+      x = ctv,
+      ord = ord,
+      outer.ok = TRUE
+    )
+  )
+
+  pre.ispv <- apply(bspv, 2, rev)
+  ispv <- apply(pre.ispv, 2, cumsum)
+  ispv <- apply(ispv, 2, rev)
+  ispv <- ispv[-1, , drop = FALSE]
+
+  ## Original six mixed-censoring cells.
+  data1 <- delta1_1 * delta1_2
+  data2 <- delta1_1 * delta2_2
+  data3 <- delta1_1 * delta3_2
+  data4 <- delta2_1 * delta1_2
+  data5 <- delta2_1 * delta2_2
+  data6 <- delta2_1 * delta3_2
+
+  noze1 <- sum(data1)
+  noze2 <- sum(data2)
+  noze3 <- sum(data3)
+  noze4 <- sum(data4)
+  noze5 <- sum(data5)
+  noze6 <- sum(data6)
+
+  ## Cache because optim commonly asks for f and gr at the same eta.
+  cache <- new.env(parent = emptyenv())
+  cache$eta <- NULL
+  cache$value <- NULL
+
+  evaluate_eta <- function(eta)
+  {
+    eta <- as.numeric(eta)
+
+    if (!is.null(cache$eta) &&
+        length(cache$eta) == length(eta) &&
+        isTRUE(all.equal(cache$eta, eta, tolerance = 0))) {
+      return(cache$value)
+    }
+
+    tr <- softmax_alpha_from_eta(eta)
+    alpha <- tr$alpha
+
+    sv <- sumvectorfunction(
+      alpha,
+      ispx, mspx, ispu, ispv
+    )
+
+    ll <- sumfunction_w(
+      sv$sum11, sv$sum22, sv$sum33,
+      sv$sum44, sv$sum55, sv$sum66,
+      data1, data2, data3,
+      data4, data5, data6,
+      w
+    )
+
+    if (!is.finite(ll)) {
+      ans <- list(
+        ll = -Inf,
+        grad_eta_loglik = rep(NA_real_, p_alpha),
+        alpha = alpha
+      )
+      cache$eta <- eta
+      cache$value <- ans
+      return(ans)
+    }
+
+    score_alpha <- as.numeric(
+      gg_pre_w(
+        ispx, mspx, ispu, ispv,
+        data1, data2, data3,
+        data4, data5, data6,
+        noze1, noze2, noze3,
+        noze4, noze5, noze6,
+        sv$sum11, sv$sum22, sv$sum33,
+        sv$sum44, sv$sum55, sv$sum66,
+        w
+      )
+    )
+
+    ## Chain rule:
+    ## d alpha_j / d eta_k = R q_j (I[j=k] - q_k)
+    ## therefore
+    ## d ll / d eta_k = R q_k {score_k - sum_j q_j score_j}.
+    q <- tr$q
+    weighted_score_mean <- sum(q * score_alpha)
+
+    grad_eta_loglik <-
+      tr$R * q * (score_alpha - weighted_score_mean)
+
+    ans <- list(
+      ll = ll,
+      grad_eta_loglik = grad_eta_loglik,
+      alpha = alpha
+    )
+
+    cache$eta <- eta
+    cache$value <- ans
+    ans
+  }
+
+  eta0 <- tryCatch(
+    softmax_eta_from_alpha(
+      alpha_init = alpha_init,
+      interior_mix = 1e-6
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(eta0, "error")) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = "bfgs_invalid_start",
+      detail = conditionMessage(eta0)
+    ))
+  }
+
+  z0 <- evaluate_eta(eta0)
+
+  if (!is.finite(z0$ll) ||
+      any(!is.finite(z0$grad_eta_loglik))) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = "bfgs_invalid_start_likelihood",
+      detail = "Softmax/BFGS start has invalid likelihood or gradient"
+    ))
+  }
+
+  fn <- function(eta)
+  {
+    z <- evaluate_eta(eta)
+
+    if (!is.finite(z$ll)) {
+      return(1e100)
+    }
+
+    -z$ll
+  }
+
+  gr <- function(eta)
+  {
+    z <- evaluate_eta(eta)
+
+    if (!is.finite(z$ll) ||
+        any(!is.finite(z$grad_eta_loglik))) {
+      return(rep(0, p_alpha))
+    }
+
+    -z$grad_eta_loglik
+  }
+
+  fit <- tryCatch(
+    optim(
+      par = eta0,
+      fn = fn,
+      gr = gr,
+      method = "BFGS",
+      control = list(
+        maxit = maxit,
+        reltol = reltol
+      )
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(fit, "error")) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = "bfgs_error",
+      detail = conditionMessage(fit)
+    ))
+  }
+
+  final <- evaluate_eta(fit$par)
+  alpha_hat <- as.numeric(final$alpha)
+
+  if (any(!is.finite(alpha_hat)) ||
+      !is.finite(final$ll) ||
+      any(!is.finite(final$grad_eta_loglik))) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = "bfgs_invalid_final_solution",
+      detail = "Nonfinite final coefficient, likelihood, or transformed gradient"
+    ))
+  }
+
+  ## Defensive feasibility check of the transformed solution.
+  if (any(alpha_hat[seq_len(sk.i)] < 1e-7 - 1e-12) ||
+      any(alpha_hat[(sk.i + 1L):p_alpha] < -1e-12) ||
+      sum(alpha_hat) >= 1 + 1e-12) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = "bfgs_transform_feasibility_failure",
+      detail = paste0(
+        "min joint=", min(alpha_hat[seq_len(sk.i)]),
+        "; min marginal=",
+        min(alpha_hat[(sk.i + 1L):p_alpha]),
+        "; sum=", sum(alpha_hat)
+      )
+    ))
+  }
+
+  if (!is.null(fit$convergence) && fit$convergence != 0) {
+    return(list(
+      alpha = -9999,
+      knot1 = -9999,
+      knot2 = -9999,
+      status = paste0("bfgs_convergence_", fit$convergence),
+      detail = paste0(
+        fit$message,
+        "; max|grad_eta|=",
+        signif(max(abs(final$grad_eta_loglik)), 5),
+        "; fn/gr evals=",
+        paste(fit$counts, collapse = "/")
+      )
+    ))
+  }
+
+  list(
+    alpha = matrix(alpha_hat, p_alpha, 1),
+    knot1 = knot1,
+    knot2 = knot2,
+    status = "success",
+    detail = paste0(
+      "softmax/BFGS; max|grad_eta|=",
+      signif(max(abs(final$grad_eta_loglik)), 5),
+      "; fn/gr evals=",
+      paste(fit$counts, collapse = "/")
+    )
+  )
+}
+
+safe_fit_bfgs <- function(dat,
+                          w = rep(1, size),
+                          alpha_init = NULL,
+                          maxit = 300L,
+                          reltol = 1e-8)
+{
+  warning_messages <- character(0)
+
+  ans <- tryCatch(
+    withCallingHandlers(
+      totest_bfgs_diag(
+        dat$x1, dat$ctu, dat$ctv,
+        dat$delta1_1, dat$delta2_1,
+        dat$delta1_2, dat$delta2_2, dat$delta3_2,
+        w = w,
+        alpha_init = alpha_init,
+        maxit = maxit,
+        reltol = reltol
+      ),
+      warning = function(wrn) {
+        warning_messages <<- c(
+          warning_messages,
+          conditionMessage(wrn)
+        )
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      list(
+        alpha = -9999,
+        knot1 = -9999,
+        knot2 = -9999,
+        status = "R_error",
+        detail = conditionMessage(e)
+      )
+    }
+  )
+
+  ans <- validate_fit(ans)
+
+  ans$n_warnings <- length(warning_messages)
+
+  ans$warning_detail <-
+    if (length(warning_messages) == 0L) {
+      NA_character_
+    } else {
+      paste(unique(warning_messages), collapse = " | ")
+    }
+
+  ans
+}
+
+safe_fit_fast <- function(dat,
+                     w = rep(1, size),
+                     alpha_init = NULL,
+                     max_halvings = 10L)
+{
+  warning_messages <- character(0)
+
+  ans <- tryCatch(
+    withCallingHandlers(
+      totest_fast_diag(
+        dat$x1, dat$ctu, dat$ctv,
+        dat$delta1_1, dat$delta2_1,
+        dat$delta1_2, dat$delta2_2, dat$delta3_2,
+        w = w,
+        alpha_init = alpha_init,
+        max_halvings = max_halvings
+      ),
+      warning = function(wrn) {
+        warning_messages <<- c(
+          warning_messages,
+          conditionMessage(wrn)
+        )
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      list(
+        alpha = -9999,
+        knot1 = -9999,
+        knot2 = -9999,
+        status = "R_error",
+        detail = conditionMessage(e)
+      )
+    }
+  )
+
+  ans <- validate_fit(ans)
+
+  ans$n_warnings <- length(warning_messages)
+
+  ans$warning_detail <-
+    if (length(warning_messages) == 0L) {
+      NA_character_
+    } else {
+      paste(unique(warning_messages), collapse = " | ")
+    }
+
+  ans
+}
+
+make_interior_start <- function(alpha_hat, mix = 1e-4)
+{
+  generic <- matrix(0.5 / p_alpha, p_alpha, 1)
+
+  ah <- matrix(as.numeric(alpha_hat), p_alpha, 1)
+  ah[ah < 0] <- 0
+
+  if (sum(ah) >= 1) {
+    ah <- ah / sum(ah) * (1 - 1e-10)
+  }
+
+  (1 - mix) * ah + mix * generic
+}
+
+make_generic_start <- function(total_mass = 0.25)
+{
+  stopifnot(total_mass > 0, total_mass < 1)
+  matrix(total_mass / p_alpha, p_alpha, 1)
+}
+
+fit_original_hybrid <- function(dat)
+{
+  ## Initial active-set fit.
+  fit1 <- safe_fit_fast(
+    dat,
+    w = rep(1, size),
+    alpha_init = NULL,
+    max_halvings = 30L
+  )
+
+  if (identical(fit1$status, "success")) {
+    return(list(
+      fit = fit1,
+      initial_status = "success",
+      initial_detail = NA_character_,
+      fast_rescue_used = FALSE,
+      fast_rescue_status = NA_character_,
+      fast_rescue_detail = NA_character_,
+      bfgs_fallback_used = FALSE,
+      bfgs_fallback_status = NA_character_,
+      bfgs_fallback_detail = NA_character_
+    ))
+  }
+
+  fit2 <- safe_fit_bfgs(
+    dat,
+    w = rep(1, size),
+    alpha_init = make_generic_start(total_mass = 0.25),
+    maxit = 500L,
+    reltol = 1e-8
+  )
+
+  list(
+    fit = fit2,
+    initial_status = fit1$status,
+    initial_detail = fit1$detail,
+    fast_rescue_used = FALSE,
+    fast_rescue_status = NA_character_,
+    fast_rescue_detail = NA_character_,
+    bfgs_fallback_used = TRUE,
+    bfgs_fallback_status = fit2$status,
+    bfgs_fallback_detail = fit2$detail
+  )
+}
+
+fit_bootstrap_with_rescue <- function(dat, w, alpha_hat)
+{
+  ## Stage 1: one fast warm-start fit.
+  fit1 <- safe_fit_fast(
+    dat,
+    w = w,
+    alpha_init = make_interior_start(alpha_hat, mix = 1e-4),
+    max_halvings = 30L
+  )
+
+  if (identical(fit1$status, "success")) {
+    return(list(
+      fit = fit1,
+      initial_status = "success",
+      initial_detail = NA_character_,
+      fast_rescue_used = FALSE,
+      fast_rescue_status = NA_character_,
+      fast_rescue_detail = NA_character_,
+      after_fast_status = "success",
+      bfgs_fallback_used = FALSE,
+      bfgs_fallback_status = NA_character_,
+      bfgs_fallback_detail = NA_character_
+    ))
+  }
+
+  ## Softmax/BFGS fallback using the same multiplier weights.
+  fit2 <- safe_fit_bfgs(
+    dat,
+    w = w,
+    alpha_init = make_interior_start(alpha_hat, mix = 0.10),
+    maxit = 300L,
+    reltol = 1e-8
+  )
+
+  list(
+    fit = fit2,
+    initial_status = fit1$status,
+    initial_detail = fit1$detail,
+    fast_rescue_used = FALSE,
+    fast_rescue_status = NA_character_,
+    fast_rescue_detail = NA_character_,
+    after_fast_status = fit1$status,
+    bfgs_fallback_used = TRUE,
+    bfgs_fallback_status = fit2$status,
+    bfgs_fallback_detail = fit2$detail
+  )
+}
+
+##  5) Basis evaluation at a single time
+
+ispline_eval <- function(t, knot_vec)
+{
+  bsp <- t(splineDesign(knots = knot_vec, x = t, ord = spline.ord, outer.ok = TRUE))
+  rev(cumsum(rev(bsp)))[-1]
+}
+
+mspline_eval <- function(t, knot_vec)
+{
+  knotb <- knot_vec[-c(1, (n.spline + spline.ord + 1))]
+  ord <- spline.ord - 1
+  bsp <- t(splineDesign(knots = knotb, x = t, ord = ord, outer.ok = TRUE))
+  as.numeric(bsp / (knotb[(1 + ord):(n.spline + ord)] - knotb[1:n.spline]) * ord)
+}
+
+##  6) Local-fit evaluation
+
+joint_fit <- function(t1, t2, fit) {
+  isp1 <- ispline_eval(t1, fit$knot1)
+  isp2 <- ispline_eval(t2, fit$knot2)
+  mu   <- t(matrix(fit$alpha[1:sk.i], k.i, k.i))
+  drop(matrix(isp1, 1, n.spline) %*% mu %*% matrix(isp2, n.spline, 1))
+}
+
+mar1_fit <- function(t, fit) {
+  isp <- ispline_eval(t, fit$knot1)
+  mu  <- t(matrix(fit$alpha[1:sk.i], k.i, k.i))
+  omg <- matrix(fit$alpha[(sk.i+k.i+1):(sk.i+2*k.i)], k.i, 1)
+  drop(matrix(isp, 1, n.spline) %*% mu %*% matrix(1, n.spline, 1) +
+         matrix(isp, 1, n.spline) %*% omg)
+}
+
+mar2_fit <- function(s, fit) {
+  isp <- ispline_eval(s, fit$knot2)
+  mu  <- t(matrix(fit$alpha[1:sk.i], k.i, k.i))
+  pi  <- matrix(fit$alpha[(sk.i+1):(sk.i+k.i)], k.i, 1)
+  drop(matrix(1, 1, n.spline) %*% mu %*% matrix(isp, n.spline, 1) +
+         matrix(isp, 1, n.spline) %*% pi)
+}
+
+barF_fit <- function(t, s, fit) {
+  val <- 1 - mar1_fit(t, fit) - mar2_fit(s, fit) + joint_fit(t, s, fit)
+  max(min(val, 1), 0)
+}
+
+dF2_ds_fit <- function(s, fit) {
+  msp2 <- mspline_eval(s, fit$knot2)
+  mu   <- t(matrix(fit$alpha[1:sk.i], k.i, k.i))
+  pi   <- matrix(fit$alpha[(sk.i+1):(sk.i+k.i)], k.i, 1)
+  drop(matrix(1, 1, n.spline) %*% mu %*% matrix(msp2, n.spline, 1) +
+         matrix(msp2, 1, n.spline) %*% pi)
+}
+
+dF_ds_fit <- function(t, s, fit) {
+  isp1 <- ispline_eval(t, fit$knot1)
+  msp2 <- mspline_eval(s, fit$knot2)
+  mu   <- t(matrix(fit$alpha[1:sk.i], k.i, k.i))
+  drop(matrix(isp1, 1, n.spline) %*% mu %*% matrix(msp2, n.spline, 1))
+}
+
+dbarF_ds_fit <- function(t, s, fit) {
+  -(dF2_ds_fit(s, fit)) + dF_ds_fit(t, s, fit)
+}
+
+##  7) Aim 2.1 integral estimator (local fits)
+
+wr_integral_aim21_local <- function(fitC, fitT, tau,
+                                      tau_l = tau_lower,
+                                      dt = 0.02, ds = 0.02) {
+  stopifnot(is.finite(tau_l), tau_l >= 0, tau_l < tau,
+            is.finite(dt), dt > 0, is.finite(ds), ds > 0)
+
+  ## The EXACT/RIGHT-CENSORED terminal primary margin is identifiable from
+  ## time zero. Preserve its ordinary finite-horizon win comparison.
+  ## Evaluate survival at right endpoints of a common partition.
+  t_edges <- seq(0, tau, length.out = ceiling(tau / dt) + 1L)
+  t_right <- t_edges[-1L]
+  F0_edges <- vapply(t_edges, mar1_fit, numeric(1), fit = fitC)
+  F1_edges <- vapply(t_edges, mar1_fit, numeric(1), fit = fitT)
+  dF0 <- diff(F0_edges)
+  dF1 <- diff(F1_edges)
+  ST1 <- pmax(0, pmin(1, 1 - vapply(t_right, mar1_fit,
+                                   numeric(1), fit = fitT)))
+  ST0 <- pmax(0, pmin(1, 1 - vapply(t_right, mar1_fit,
+                                   numeric(1), fit = fitC)))
+  W_primary <- sum(ST1 * dF0)
+  L_primary <- sum(ST0 * dF1)
+
+  ## UPDATED THEOREM: The secondary margin is interval-censored.
+  ## Restrict the earlier secondary event to [tau_l, tau].
+  ## Midpoint quadrature avoids using an endpoint outside the interval.
+  s_edges <- seq(tau_l, tau,
+                 length.out = ceiling((tau - tau_l) / ds) + 1L)
+  s_mid <- (head(s_edges, -1L) + tail(s_edges, -1L)) / 2
+  widths <- diff(s_edges)
+  barF1_tau_s <- vapply(s_mid, function(s) barF_fit(tau, s, fitT), numeric(1))
+  dbarF0_ds <- vapply(s_mid, function(s) dbarF_ds_fit(tau, s, fitC), numeric(1))
+  barF0_tau_s <- vapply(s_mid, function(s) barF_fit(tau, s, fitC), numeric(1))
+  dbarF1_ds <- vapply(s_mid, function(s) dbarF_ds_fit(tau, s, fitT), numeric(1))
+
+  W_sec <- -sum(barF1_tau_s * dbarF0_ds * widths)
+  L_sec <- -sum(barF0_tau_s * dbarF1_ds * widths)
+
+  W <- W_primary + W_sec
+  L <- L_primary + L_sec
+  if (!all(is.finite(c(W, L, W_primary, W_sec, L_primary, L_sec))) ||
+      W <= 0 || L <= 0 ||
+      min(W_primary, W_sec, L_primary, L_sec) < -1e-7) {
+    return(c(W=NA_real_, L=NA_real_, WR=NA_real_))
+  }
+  c(W=W, L=L, WR=W/L,
+    W_primary=W_primary, W_sec=W_sec,
+    L_primary=L_primary, L_sec=L_sec)
+}
+
+## TRUE WRs: TRIMMED AND UNTRIMMED FROM THE SAME MC DRAWS
+
+true_WR_mc_both <- function(theta,
+                            lambda0, mu0,
+                            lambda1, mu1,
+                            tau,
+                            tau_l = tau_lower,
+                            Nmc = 5000000L,
+                            seed = 12345L)
+{
+  stopifnot(is.finite(tau_l), tau_l > 0, tau_l < tau)
+  set.seed(seed)
+
+  cc <- copula::gumbelCopula(param = theta, dim = 2)
+
+  U0 <- copula::rCopula(Nmc, cc)
+  T0 <- qexp(U0[,1], rate = lambda0)
+  S0 <- qexp(U0[,2], rate = mu0)
+  rm(U0)
+
+  U1 <- copula::rCopula(Nmc, cc)
+  T1 <- qexp(U1[,1], rate = lambda1)
+  S1 <- qexp(U1[,2], rate = mu1)
+  rm(U1)
+
+  primary_conc <- pmin(T0, T1) <= tau
+  tie_primary  <- !primary_conc
+
+  win_primary  <- primary_conc & (T1 > T0)
+  loss_primary <- primary_conc & (T1 < T0)
+
+  calc_one <- function(lower)
+  {
+    stopifnot(is.finite(lower), lower >= 0, lower < tau)
+
+    win_sec <-
+      tie_primary &
+      (S1 > S0) &
+      (S0 >= lower) &
+      (S0 <= tau)
+
+    loss_sec <-
+      tie_primary &
+      (S1 < S0) &
+      (S1 >= lower) &
+      (S1 <= tau)
+
+    W <- mean(win_primary | win_sec)
+    L <- mean(loss_primary | loss_sec)
+
+    c(
+      W = W,
+      L = L,
+      WR = W/L,
+      logWR = log(W/L),
+      W_primary = mean(win_primary),
+      L_primary = mean(loss_primary),
+      W_secondary = mean(win_sec),
+      L_secondary = mean(loss_sec)
+    )
+  }
+
+  list(
+    trimmed = calc_one(tau_l),
+    untrimmed = calc_one(0)
+  )
+}
+
+## SAFE WR FUNCTIONALS
+
+safe_wr_tau <- function(fitC, fitT, tau_l)
+{
+  out <- tryCatch(
+    wr_integral_aim21_local(
+      fitC, fitT,
+      tau = tau,
+      tau_l = tau_l,
+      dt = dt,
+      ds = ds
+    ),
+    error = function(e) {
+      c(
+        W = NA_real_,
+        L = NA_real_,
+        WR = NA_real_
+      )
+    }
+  )
+
+  wr <- suppressWarnings(as.numeric(out["WR"]))
+
+  if (!is.finite(wr) || wr <= 0) {
+    return(list(
+      status = "functional_failure",
+      WR = NA_real_,
+      logWR = NA_real_
+    ))
+  }
+
+  list(
+    status = "success",
+    WR = wr,
+    logWR = log(wr)
+  )
+}
+
+safe_wr_trimmed <- function(fitC, fitT) {
+  safe_wr_tau(fitC, fitT, tau_l = tau_lower)
+}
+
+safe_wr_untrimmed <- function(fitC, fitT) {
+  safe_wr_tau(fitC, fitT, tau_l = 0)
+}
+
+# Multiplier bootstrap
+
+one_bootstrap <- function(b, W0, W1,
+                          datC, datT,
+                          fitC, fitT)
+{
+  wC <- W0[b, ]
+  wT <- W1[b, ]
+
+  ## The weighted fits are performed ONCE for this multiplier draw.
+  ## Both trimmed and untrimmed WRs are then evaluated from the same fits.
+  resC <- fit_bootstrap_with_rescue(
+    datC, wC, fitC$alpha
+  )
+
+  resT <- fit_bootstrap_with_rescue(
+    datT, wT, fitT$alpha
+  )
+
+  fC <- resC$fit
+  fT <- resT$fit
+
+  both_fit_ok <-
+    identical(fC$status, "success") &&
+    identical(fT$status, "success")
+
+  if (both_fit_ok) {
+    fun_trim <- safe_wr_trimmed(fC, fT)
+    fun_untrim <- safe_wr_untrimmed(fC, fT)
+  } else {
+    fun_trim <- list(
+      status = "not_evaluated_fit_failure",
+      WR = NA_real_,
+      logWR = NA_real_
+    )
+    fun_untrim <- fun_trim
+  }
+
+  final_status_trimmed <-
+    if (both_fit_ok && identical(fun_trim$status, "success")) {
+      "success"
+    } else if (!both_fit_ok) {
+      "fit_failure"
+    } else {
+      "functional_failure"
+    }
+
+  final_status_untrimmed <-
+    if (both_fit_ok && identical(fun_untrim$status, "success")) {
+      "success"
+    } else if (!both_fit_ok) {
+      "fit_failure"
+    } else {
+      "functional_failure"
+    }
+
+  data.frame(
+    bootstrap_rep = b,
+
+    fitC_initial_status = resC$initial_status,
+    fitC_initial_detail = resC$initial_detail,
+    fitC_fast_rescue_used = resC$fast_rescue_used,
+    fitC_fast_rescue_status = resC$fast_rescue_status,
+    fitC_fast_rescue_detail = resC$fast_rescue_detail,
+    fitC_after_fast_status = resC$after_fast_status,
+    fitC_bfgs_fallback_used = resC$bfgs_fallback_used,
+    fitC_bfgs_fallback_status = resC$bfgs_fallback_status,
+    fitC_bfgs_fallback_detail = resC$bfgs_fallback_detail,
+    fitC_final_status = fC$status,
+    fitC_final_detail = fC$detail,
+
+    fitT_initial_status = resT$initial_status,
+    fitT_initial_detail = resT$initial_detail,
+    fitT_fast_rescue_used = resT$fast_rescue_used,
+    fitT_fast_rescue_status = resT$fast_rescue_status,
+    fitT_fast_rescue_detail = resT$fast_rescue_detail,
+    fitT_after_fast_status = resT$after_fast_status,
+    fitT_bfgs_fallback_used = resT$bfgs_fallback_used,
+    fitT_bfgs_fallback_status = resT$bfgs_fallback_status,
+    fitT_bfgs_fallback_detail = resT$bfgs_fallback_detail,
+    fitT_final_status = fT$status,
+    fitT_final_detail = fT$detail,
+
+    functional_status = fun_trim$status,
+    WR = fun_trim$WR,
+    logWR = fun_trim$logWR,
+    final_status = final_status_trimmed,
+
+    functional_status_untrimmed = fun_untrim$status,
+    WR_untrimmed = fun_untrim$WR,
+    logWR_untrimmed = fun_untrim$logWR,
+    final_status_untrimmed = final_status_untrimmed,
+
+    stringsAsFactors = FALSE
+  )
+}
+
+summarize_bootstrap_dataset <- function(boot_df,
+                                        logWR_hat,
+                                        true_logWR)
+{
+  initial_both_ok <-
+    boot_df$fitC_initial_status == "success" &
+    boot_df$fitT_initial_status == "success"
+
+  after_fast_both_ok <-
+    boot_df$fitC_after_fast_status == "success" &
+    boot_df$fitT_after_fast_status == "success"
+
+  final_both_fit_ok <-
+    boot_df$fitC_final_status == "success" &
+    boot_df$fitT_final_status == "success"
+
+  final_ok <-
+    boot_df$final_status == "success" &
+    is.finite(boot_df$logWR)
+
+  z_initial <- boot_df$logWR[
+    final_ok & initial_both_ok
+  ]
+
+  z_final <- boot_df$logWR[final_ok]
+
+  se_initial <-
+    if (length(z_initial) >= 2L) sd(z_initial) else NA_real_
+
+  se_final <-
+    if (length(z_final) >= 2L) sd(z_final) else NA_real_
+
+  rescue_change_pct <-
+    if (is.finite(se_initial) &&
+        is.finite(se_final) &&
+        se_final > 0) {
+      100 * abs(se_final - se_initial) / se_final
+    } else {
+      NA_real_
+    }
+
+  n_unresolved <- nrow(boot_df) - sum(final_ok)
+
+  zcrit <- qnorm(0.975)
+
+  cover95 <-
+    if (is.finite(se_final)) {
+      as.integer(
+        logWR_hat - zcrit*se_final <= true_logWR &&
+        logWR_hat + zcrit*se_final >= true_logWR
+      )
+    } else {
+      NA_integer_
+    }
+
+  se_tail_low <- se_final
+  se_tail_high <- se_final
+  se_tail_split <- se_final
+
+  tail_low_change_pct <- 0
+  tail_high_change_pct <- 0
+  tail_split_change_pct <- 0
+
+  if (length(z_final) >= 2L && n_unresolved > 0L)
+  {
+    qq <- as.numeric(
+      quantile(
+        z_final,
+        probs = c(0.01, 0.99),
+        names = FALSE
+      )
+    )
+
+    qlo <- qq[1]
+    qhi <- qq[2]
+
+    se_tail_low <- sd(
+      c(z_final, rep(qlo, n_unresolved))
+    )
+
+    se_tail_high <- sd(
+      c(z_final, rep(qhi, n_unresolved))
+    )
+
+    nlo <- floor(n_unresolved/2)
+    nhi <- n_unresolved - nlo
+
+    se_tail_split <- sd(
+      c(
+        z_final,
+        rep(qlo, nlo),
+        rep(qhi, nhi)
+      )
+    )
+
+    tail_low_change_pct <-
+      100 * (se_tail_low - se_final) / se_final
+
+    tail_high_change_pct <-
+      100 * (se_tail_high - se_final) / se_final
+
+    tail_split_change_pct <-
+      100 * (se_tail_split - se_final) / se_final
+  }
+
+  data.frame(
+    n_boot_attempted = nrow(boot_df),
+
+    n_initial_any_fit_fail =
+      sum(!initial_both_ok),
+
+    initial_any_fit_failure_pct =
+      100 * mean(!initial_both_ok),
+
+    n_after_fast_any_fit_fail =
+      sum(!after_fast_both_ok),
+
+    after_fast_any_fit_failure_pct =
+      100 * mean(!after_fast_both_ok),
+
+    n_fitC_initial_fail =
+      sum(boot_df$fitC_initial_status != "success"),
+
+    n_fitT_initial_fail =
+      sum(boot_df$fitT_initial_status != "success"),
+
+    n_fitC_fast_rescued =
+      sum(
+        boot_df$fitC_initial_status != "success" &
+        boot_df$fitC_after_fast_status == "success"
+      ),
+
+    n_fitT_fast_rescued =
+      sum(
+        boot_df$fitT_initial_status != "success" &
+        boot_df$fitT_after_fast_status == "success"
+      ),
+
+    n_fitC_bfgs_fallback_used =
+      sum(boot_df$fitC_bfgs_fallback_used),
+
+    n_fitT_bfgs_fallback_used =
+      sum(boot_df$fitT_bfgs_fallback_used),
+
+    n_fitC_bfgs_rescued =
+      sum(
+        boot_df$fitC_after_fast_status != "success" &
+        boot_df$fitC_final_status == "success"
+      ),
+
+    n_fitT_bfgs_rescued =
+      sum(
+        boot_df$fitT_after_fast_status != "success" &
+        boot_df$fitT_final_status == "success"
+      ),
+
+    n_final_any_fit_fail =
+      sum(!final_both_fit_ok),
+
+    residual_any_fit_failure_pct =
+      100 * mean(!final_both_fit_ok),
+
+    n_functional_fail =
+      sum(
+        final_both_fit_ok &
+        boot_df$functional_status != "success"
+      ),
+
+    n_final_success = sum(final_ok),
+
+    n_residual_unusable = n_unresolved,
+
+    residual_unusable_pct =
+      100 * n_unresolved / nrow(boot_df),
+
+    se_initial_success_only = se_initial,
+    se_after_rescue = se_final,
+
+    abs_se_change_rescue_pct =
+      rescue_change_pct,
+
+    cover95 = cover95,
+
+    se_tail_low = se_tail_low,
+    se_tail_high = se_tail_high,
+    se_tail_split = se_tail_split,
+
+    tail_low_change_pct = tail_low_change_pct,
+    tail_high_change_pct = tail_high_change_pct,
+    tail_split_change_pct = tail_split_change_pct,
+
+    stringsAsFactors = FALSE
+  )
+}
+
+summarize_bootstrap_dataset_untrimmed <- function(boot_df,
+                                                  logWR_hat,
+                                                  true_logWR)
+{
+  tmp <- boot_df
+
+  ## Re-map only the functional columns. The weighted fits and all fit
+  ## diagnostics are exactly the same as for the trimmed target.
+  tmp$functional_status <- tmp$functional_status_untrimmed
+  tmp$WR <- tmp$WR_untrimmed
+  tmp$logWR <- tmp$logWR_untrimmed
+  tmp$final_status <- tmp$final_status_untrimmed
+
+  out <- summarize_bootstrap_dataset(
+    tmp,
+    logWR_hat = logWR_hat,
+    true_logWR = true_logWR
+  )
+
+  names(out) <- paste0(names(out), "_untrimmed")
+  out
+}
+
+empty_boot_summary <- function()
+{
+  data.frame(
+    n_boot_attempted = NA_integer_,
+    n_initial_any_fit_fail = NA_integer_,
+    initial_any_fit_failure_pct = NA_real_,
+    n_after_fast_any_fit_fail = NA_integer_,
+    after_fast_any_fit_failure_pct = NA_real_,
+    n_fitC_initial_fail = NA_integer_,
+    n_fitT_initial_fail = NA_integer_,
+    n_fitC_fast_rescued = NA_integer_,
+    n_fitT_fast_rescued = NA_integer_,
+    n_fitC_bfgs_fallback_used = NA_integer_,
+    n_fitT_bfgs_fallback_used = NA_integer_,
+    n_fitC_bfgs_rescued = NA_integer_,
+    n_fitT_bfgs_rescued = NA_integer_,
+    n_final_any_fit_fail = NA_integer_,
+    residual_any_fit_failure_pct = NA_real_,
+    n_functional_fail = NA_integer_,
+    n_final_success = NA_integer_,
+    n_residual_unusable = NA_integer_,
+    residual_unusable_pct = NA_real_,
+    se_initial_success_only = NA_real_,
+    se_after_rescue = NA_real_,
+    abs_se_change_rescue_pct = NA_real_,
+    cover95 = NA_integer_,
+    se_tail_low = NA_real_,
+    se_tail_high = NA_real_,
+    se_tail_split = NA_real_,
+    tail_low_change_pct = NA_real_,
+    tail_high_change_pct = NA_real_,
+    tail_split_change_pct = NA_real_
+  )
+}
+
+empty_boot_summary_both <- function()
+{
+  x1 <- empty_boot_summary()
+  x2 <- x1
+  names(x2) <- paste0(names(x2), "_untrimmed")
+  cbind(x1, x2)
+}
+
+make_failure_reason_table <- function(mc_results, boot_results)
+{
+  add_counts <- function(x, stage, arm, denominator)
+  {
+    if (denominator <= 0L) return(NULL)
+
+    x <- x[!is.na(x) & x != "success"]
+
+    if (length(x) == 0L) return(NULL)
+
+    tt <- sort(table(x), decreasing = TRUE)
+
+    data.frame(
+      stage = stage,
+      arm = arm,
+      reason = names(tt),
+      count = as.integer(tt),
+      denominator = denominator,
+      percent = 100 * as.integer(tt) / denominator,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  pieces <- list(
+    ## Original-data fast fit failures.
+    add_counts(
+      mc_results$fitC_initial_status,
+      "original_fast",
+      "control",
+      nrow(mc_results)
+    ),
+    add_counts(
+      mc_results$fitT_initial_status,
+      "original_fast",
+      "treatment",
+      nrow(mc_results)
+    ),
+
+    ## BFGS fallback failures, conditional on fallback being used.
+    add_counts(
+      mc_results$fitC_bfgs_fallback_status[
+        mc_results$fitC_bfgs_fallback_used
+      ],
+      "original_bfgs_fallback",
+      "control",
+      sum(mc_results$fitC_bfgs_fallback_used)
+    ),
+    add_counts(
+      mc_results$fitT_bfgs_fallback_status[
+        mc_results$fitT_bfgs_fallback_used
+      ],
+      "original_bfgs_fallback",
+      "treatment",
+      sum(mc_results$fitT_bfgs_fallback_used)
+    )
+  )
+
+  if (nrow(boot_results) > 0L)
+  {
+    pieces <- c(
+      pieces,
+      list(
+        ## Bootstrap fast-fit failures.
+        add_counts(
+          boot_results$fitC_initial_status,
+          "bootstrap_fast",
+          "control",
+          nrow(boot_results)
+        ),
+        add_counts(
+          boot_results$fitT_initial_status,
+          "bootstrap_fast",
+          "treatment",
+          nrow(boot_results)
+        ),
+
+        ## BFGS fallback failures, conditional on fallback being used.
+        add_counts(
+          boot_results$fitC_bfgs_fallback_status[
+            boot_results$fitC_bfgs_fallback_used
+          ],
+          "bootstrap_bfgs_fallback",
+          "control",
+          sum(boot_results$fitC_bfgs_fallback_used)
+        ),
+        add_counts(
+          boot_results$fitT_bfgs_fallback_status[
+            boot_results$fitT_bfgs_fallback_used
+          ],
+          "bootstrap_bfgs_fallback",
+          "treatment",
+          sum(boot_results$fitT_bfgs_fallback_used)
+        ),
+
+        ## Final failures after the two-stage procedure.
+        add_counts(
+          boot_results$fitC_final_status,
+          "bootstrap_final",
+          "control",
+          nrow(boot_results)
+        ),
+        add_counts(
+          boot_results$fitT_final_status,
+          "bootstrap_final",
+          "treatment",
+          nrow(boot_results)
+        )
+      )
+    )
+  }
+
+  pieces <- pieces[
+    !vapply(pieces, is.null, logical(1))
+  ]
+
+  if (length(pieces) == 0L) {
+    return(
+      data.frame(
+        stage = character(0),
+        arm = character(0),
+        reason = character(0),
+        count = integer(0),
+        denominator = integer(0),
+        percent = numeric(0)
+      )
+    )
+  }
+
+  do.call(rbind, pieces)
+}
+
+## TRUE VALUE
+
+cat("\nComputing trimmed and untrimmed Monte Carlo truths from the SAME MC draws...\n")
+
+true_both <- true_WR_mc_both(
+  theta = theta,
+  lambda0 = lambC, mu0 = muC,
+  lambda1 = lambT, mu1 = muT,
+  tau = tau,
+  tau_l = tau_lower,
+  Nmc = NMC_TRUTH,
+  seed = truth_seed
+)
+
+true_trim <- true_both$trimmed
+true_untrim <- true_both$untrimmed
+
+WR_true <- as.numeric(true_trim["WR"])
+logWR_true <- as.numeric(true_trim["logWR"])
+
+WR_true_untrimmed <- as.numeric(true_untrim["WR"])
+logWR_true_untrimmed <- as.numeric(true_untrim["logWR"])
+
+cat("Trimmed   true WR     =", WR_true, "\n")
+cat("Trimmed   true log-WR =", logWR_true, "\n")
+cat("Untrimmed true WR     =", WR_true_untrimmed, "\n")
+cat("Untrimmed true log-WR =", logWR_true_untrimmed, "\n")
+cat("Truth difference (untrimmed - trimmed), log-WR =",
+    logWR_true_untrimmed - logWR_true, "\n")
+
+## PARALLEL BACKEND
+
+cl <- NULL
+
+if (USE_PARALLEL) {
+  cl <- parallel::makeCluster(N_CORES)
+  doParallel::registerDoParallel(cl)
+  cat("Parallel bootstrap fitting with", N_CORES, "cores.\n")
+} else {
+  foreach::registerDoSEQ()
+  cat("Sequential bootstrap fitting.\n")
+}
+
+# Monte Carlo truth
+
+set.seed(simulation_seed)
+
+mc_list <- vector("list", M)
+boot_list <- vector("list", M)
+
+ptm <- proc.time()
+
+for (m in seq_len(M))
+{
+  cat(
+    "\n============================================================\n",
+    "Dataset ", m, " of ", M, "\n",
+    "============================================================\n",
+    sep = ""
+  )
+  flush.console()
+
+  visitsC_list <- make_subject_visits(size)
+  visitsT_list <- make_subject_visits(size)
+
+  timeC <- get_time(theta, lambC, muC, size)
+  timeT <- get_time(theta, lambT, muT, size)
+
+  datC <- from.event.to.censor(
+    size, timeC$x1, timeC$x2, visitsC_list
+  )
+
+  datT <- from.event.to.censor(
+    size, timeT$x1, timeT$x2, visitsT_list
+  )
+
+  ## Realized censoring diagnostics.
+  primary_rc_C <- 100 * mean(datC$delta2_1)
+  primary_rc_T <- 100 * mean(datT$delta2_1)
+
+  before_first_C <- 100 * mean(datC$x1 < datC$first_visit)
+  before_first_T <- 100 * mean(datT$x1 < datT$first_visit)
+
+  sec_left_C <- 100 * mean(datC$delta1_2)
+  sec_int_C  <- 100 * mean(datC$delta2_2)
+  sec_right_C <- 100 * mean(datC$delta3_2)
+
+  sec_left_T <- 100 * mean(datT$delta1_2)
+  sec_int_T  <- 100 * mean(datT$delta2_2)
+  sec_right_T <- 100 * mean(datT$delta3_2)
+
+  ## Original unweighted fits: hybrid numerical strategy.
+  ## No generated dataset is replaced.
+  origC <- fit_original_hybrid(datC)
+  origT <- fit_original_hybrid(datT)
+
+  fitC <- origC$fit
+  fitT <- origT$fit
+
+  both_fit_ok <-
+    identical(fitC$status, "success") &&
+    identical(fitT$status, "success")
+
+  if (both_fit_ok) {
+    ## Evaluate BOTH targets from the SAME two fitted survival surfaces.
+    point_fun <- safe_wr_trimmed(fitC, fitT)
+    point_fun_untrimmed <- safe_wr_untrimmed(fitC, fitT)
+  } else {
+    point_fun <- list(
+      status = "not_evaluated_fit_failure",
+      WR = NA_real_,
+      logWR = NA_real_
+    )
+    point_fun_untrimmed <- point_fun
+  }
+
+  point_ok <-
+    both_fit_ok &&
+    identical(point_fun$status, "success") &&
+    is.finite(point_fun$logWR)
+
+  point_ok_untrimmed <-
+    both_fit_ok &&
+    identical(point_fun_untrimmed$status, "success") &&
+    is.finite(point_fun_untrimmed$logWR)
+
+  rec <- data.frame(
+    dataset = m,
+
+    primary_right_censor_control_pct = primary_rc_C,
+    primary_right_censor_treatment_pct = primary_rc_T,
+
+    followup_before_first_visit_control_pct = before_first_C,
+    followup_before_first_visit_treatment_pct = before_first_T,
+
+    secondary_left_control_pct = sec_left_C,
+    secondary_interval_control_pct = sec_int_C,
+    secondary_right_control_pct = sec_right_C,
+
+    secondary_left_treatment_pct = sec_left_T,
+    secondary_interval_treatment_pct = sec_int_T,
+    secondary_right_treatment_pct = sec_right_T,
+
+    fitC_initial_status = origC$initial_status,
+    fitC_fast_rescue_status = origC$fast_rescue_status,
+    fitC_bfgs_fallback_used = origC$bfgs_fallback_used,
+    fitC_bfgs_fallback_status = origC$bfgs_fallback_status,
+    fitC_status = fitC$status,
+    fitC_detail = fitC$detail,
+
+    fitT_initial_status = origT$initial_status,
+    fitT_fast_rescue_status = origT$fast_rescue_status,
+    fitT_bfgs_fallback_used = origT$bfgs_fallback_used,
+    fitT_bfgs_fallback_status = origT$bfgs_fallback_status,
+    fitT_status = fitT$status,
+    fitT_detail = fitT$detail,
+
+    ## Trimmed target
+    functional_status = point_fun$status,
+
+    point_status =
+      if (point_ok) "success"
+      else if (!both_fit_ok) "fit_failure"
+      else "functional_failure",
+
+    WR_hat =
+      if (point_ok) point_fun$WR else NA_real_,
+
+    logWR_hat =
+      if (point_ok) point_fun$logWR else NA_real_,
+
+    functional_status_untrimmed = point_fun_untrimmed$status,
+
+    point_status_untrimmed =
+      if (point_ok_untrimmed) "success"
+      else if (!both_fit_ok) "fit_failure"
+      else "functional_failure",
+
+    WR_hat_untrimmed =
+      if (point_ok_untrimmed) point_fun_untrimmed$WR else NA_real_,
+
+    logWR_hat_untrimmed =
+      if (point_ok_untrimmed) point_fun_untrimmed$logWR else NA_real_,
+
+    logWR_difference_untrimmed_minus_trimmed =
+      if (point_ok && point_ok_untrimmed) {
+        point_fun_untrimmed$logWR - point_fun$logWR
+      } else {
+        NA_real_
+      },
+
+    stringsAsFactors = FALSE
+  )
+
+  if (!both_fit_ok)
+  {
+    cat(
+      "Original fits unavailable:",
+      "| control =", fitC$status,
+      "| treatment =", fitT$status,
+      "\n"
+    )
+
+    rec <- cbind(rec, empty_boot_summary_both())
+
+    mc_list[[m]] <- rec
+    boot_list[[m]] <- NULL
+    next
+  }
+
+  cat(
+    "Original fits successful; trimmed log-WR =",
+    if (point_ok) round(point_fun$logWR, 6) else NA_real_,
+    "; untrimmed log-WR =",
+    if (point_ok_untrimmed) round(point_fun_untrimmed$logWR, 6) else NA_real_,
+    "\n"
+  )
+
+  ## B multiplier realizations.
+  ## Arm-specific multipliers are independent.
+  W0 <- matrix(
+    rexp(B * size, rate = 1),
+    nrow = B,
+    ncol = size
+  )
+
+  W1 <- matrix(
+    rexp(B * size, rate = 1),
+    nrow = B,
+    ncol = size
+  )
+
+  ## Normalization does not change the arm-specific weighted MLE;
+  ## it only removes an irrelevant common scale in each draw.
+  W0 <- W0 / rowMeans(W0)
+  W1 <- W1 / rowMeans(W1)
+
+  if (USE_PARALLEL)
+  {
+    boot_rows <- foreach(
+      b = seq_len(B),
+      .combine = rbind,
+      .packages = "splines"
+    ) %dopar% {
+      one_bootstrap(
+        b, W0, W1,
+        datC, datT,
+        fitC, fitT
+      )
+    }
+
+  } else {
+
+    boot_rows <- do.call(
+      rbind,
+      lapply(
+        seq_len(B),
+        function(b) {
+          one_bootstrap(
+            b, W0, W1,
+            datC, datT,
+            fitC, fitT
+          )
+        }
+      )
+    )
+  }
+
+  boot_rows$dataset <- m
+  boot_rows <- boot_rows[
+    ,
+    c("dataset", setdiff(names(boot_rows), "dataset"))
+  ]
+
+  boot_list[[m]] <- boot_rows
+
+  bs <- summarize_bootstrap_dataset(
+    boot_rows,
+    logWR_hat = point_fun$logWR,
+    true_logWR = logWR_true
+  )
+
+  bs_untrim <- summarize_bootstrap_dataset_untrimmed(
+    boot_rows,
+    logWR_hat = point_fun_untrimmed$logWR,
+    true_logWR = logWR_true_untrimmed
+  )
+
+  rec <- cbind(rec, bs, bs_untrim)
+  mc_list[[m]] <- rec
+
+  cat(
+    "Bootstrap fits attempted once:", B, "draws;",
+    "trimmed usable =", bs$n_final_success,
+    "SE =", round(bs$se_after_rescue, 6),
+    "cover =", bs$cover95, ";",
+    "untrimmed usable =", bs_untrim$n_final_success_untrimmed,
+    "SE =", round(bs_untrim$se_after_rescue_untrimmed, 6),
+    "cover =", bs_untrim$cover95_untrimmed,
+    "\n"
+  )
+
+  ## Checkpoint.
+  mc_checkpoint <- do.call(
+    rbind,
+    mc_list[!vapply(mc_list, is.null, logical(1))]
+  )
+
+  write.csv(
+    mc_checkpoint,
+    file.path(
+      OUTPUT_DIR,
+      paste0(output_tag, "_MC_results_checkpoint.csv")
+    ),
+    row.names = FALSE
+  )
+}
+
+if (!is.null(cl)) {
+  parallel::stopCluster(cl)
+}
+
+## COMBINE + SUMMARIZE
+
+mc_results <- do.call(
+  rbind,
+  mc_list[!vapply(mc_list, is.null, logical(1))]
+)
+
+nonempty_boot <- boot_list[
+  !vapply(boot_list, is.null, logical(1))
+]
+
+boot_results <-
+  if (length(nonempty_boot) > 0L) {
+    do.call(rbind, nonempty_boot)
+  } else {
+    data.frame()
+  }
+
+point_ok <-
+  mc_results$point_status == "success" &
+  is.finite(mc_results$logWR_hat)
+
+infer_ok <-
+  point_ok &
+  is.finite(mc_results$se_after_rescue)
+
+n_point <- sum(point_ok)
+n_infer <- sum(infer_ok)
+
+mean_logWR <- if (n_point > 0L) {
+  mean(mc_results$logWR_hat[point_ok])
+} else {
+  NA_real_
+}
+
+bias_logWR <- if (is.finite(mean_logWR)) {
+  mean_logWR - logWR_true
+} else {
+  NA_real_
+}
+
+ESE_all <- if (n_point > 1L) {
+  sd(mc_results$logWR_hat[point_ok])
+} else {
+  NA_real_
+}
+
+ESE_infer <- if (n_infer > 1L) {
+  sd(mc_results$logWR_hat[infer_ok])
+} else {
+  NA_real_
+}
+
+ASE <- if (n_infer > 0L) {
+  mean(mc_results$se_after_rescue[infer_ok])
+} else {
+  NA_real_
+}
+
+coverage95 <- if (n_infer > 0L) {
+  mean(mc_results$cover95[infer_ok])
+} else {
+  NA_real_
+}
+
+## Untrimmed target performance from the SAME datasets / fits
+
+point_ok_untrimmed <-
+  mc_results$point_status_untrimmed == "success" &
+  is.finite(mc_results$logWR_hat_untrimmed)
+
+infer_ok_untrimmed <-
+  point_ok_untrimmed &
+  is.finite(mc_results$se_after_rescue_untrimmed)
+
+n_point_untrimmed <- sum(point_ok_untrimmed)
+n_infer_untrimmed <- sum(infer_ok_untrimmed)
+
+mean_logWR_untrimmed <- if (n_point_untrimmed > 0L) {
+  mean(mc_results$logWR_hat_untrimmed[point_ok_untrimmed])
+} else {
+  NA_real_
+}
+
+bias_logWR_untrimmed <- if (is.finite(mean_logWR_untrimmed)) {
+  mean_logWR_untrimmed - logWR_true_untrimmed
+} else {
+  NA_real_
+}
+
+ESE_all_untrimmed <- if (n_point_untrimmed > 1L) {
+  sd(mc_results$logWR_hat_untrimmed[point_ok_untrimmed])
+} else {
+  NA_real_
+}
+
+ESE_infer_untrimmed <- if (n_infer_untrimmed > 1L) {
+  sd(mc_results$logWR_hat_untrimmed[infer_ok_untrimmed])
+} else {
+  NA_real_
+}
+
+ASE_untrimmed <- if (n_infer_untrimmed > 0L) {
+  mean(mc_results$se_after_rescue_untrimmed[infer_ok_untrimmed])
+} else {
+  NA_real_
+}
+
+coverage95_untrimmed <- if (n_infer_untrimmed > 0L) {
+  mean(mc_results$cover95_untrimmed[infer_ok_untrimmed])
+} else {
+  NA_real_
+}
+
+## Reported WR estimate:
+## exponentiated mean estimated log-WR, consistent with the
+## definition used in the manuscript/Supplement.
+
+WR_estimate_trimmed <- if (is.finite(mean_logWR)) {
+  exp(mean_logWR)
+} else {
+  NA_real_
+}
+
+WR_estimate_untrimmed <- if (is.finite(mean_logWR_untrimmed)) {
+  exp(mean_logWR_untrimmed)
+} else {
+  NA_real_
+}
+paired_point_ok <- point_ok & point_ok_untrimmed
+
+mean_logWR_difference <- if (sum(paired_point_ok) > 0L) {
+  mean(
+    mc_results$logWR_hat_untrimmed[paired_point_ok] -
+    mc_results$logWR_hat[paired_point_ok]
+  )
+} else {
+  NA_real_
+}
+
+max_abs_logWR_difference <- if (sum(paired_point_ok) > 0L) {
+  max(abs(
+    mc_results$logWR_hat_untrimmed[paired_point_ok] -
+    mc_results$logWR_hat[paired_point_ok]
+  ))
+} else {
+  NA_real_
+}
+
+performance_results <- data.frame(
+  target = c(
+    paste0("Trimmed: secondary lower limit = ", tau_lower),
+    "Untrimmed exploratory (not theorem-supported): secondary lower limit = 0"
+  ),
+  tau_lower_secondary = c(tau_lower, 0),
+  true_WR = c(WR_true, WR_true_untrimmed),
+  true_logWR = c(logWR_true, logWR_true_untrimmed),
+  n_valid_point_estimates = c(n_point, n_point_untrimmed),
+  n_with_bootstrap_SE = c(n_infer, n_infer_untrimmed),
+WR_estimate = c(
+  WR_estimate_trimmed,
+  WR_estimate_untrimmed
+),
+  mean_logWR = c(mean_logWR, mean_logWR_untrimmed),
+  bias_logWR = c(bias_logWR, bias_logWR_untrimmed),
+  ESE_logWR_all = c(ESE_all, ESE_all_untrimmed),
+  ESE_logWR_inference_subset = c(ESE_infer, ESE_infer_untrimmed),
+  ASE_logWR = c(ASE, ASE_untrimmed),
+  coverage95 = c(coverage95, coverage95_untrimmed),
+  stringsAsFactors = FALSE
+)
+
+## NUMERICAL DIAGNOSTICS
+
+orig_initial_C_fail <- mc_results$fitC_initial_status != "success"
+orig_initial_T_fail <- mc_results$fitT_initial_status != "success"
+orig_initial_any_fail <- orig_initial_C_fail | orig_initial_T_fail
+
+orig_bfgs_C_used <- mc_results$fitC_bfgs_fallback_used
+orig_bfgs_T_used <- mc_results$fitT_bfgs_fallback_used
+
+orig_C_fail <- mc_results$fitC_status != "success"
+orig_T_fail <- mc_results$fitT_status != "success"
+orig_any_fail <- orig_C_fail | orig_T_fail
+
+orig_functional_fail <-
+  mc_results$fitC_status == "success" &
+  mc_results$fitT_status == "success" &
+  mc_results$functional_status != "success"
+
+if (nrow(boot_results) > 0L)
+{
+  boot_initial_C_fail <-
+    boot_results$fitC_initial_status != "success"
+
+  boot_initial_T_fail <-
+    boot_results$fitT_initial_status != "success"
+
+  boot_initial_any_fail <-
+    boot_initial_C_fail | boot_initial_T_fail
+
+  boot_after_fast_C_fail <- boot_initial_C_fail
+  boot_after_fast_T_fail <- boot_initial_T_fail
+  boot_after_fast_any_fail <- boot_initial_any_fail
+
+  boot_bfgs_C_used <-
+    boot_results$fitC_bfgs_fallback_used
+
+  boot_bfgs_T_used <-
+    boot_results$fitT_bfgs_fallback_used
+
+  boot_final_C_fail <-
+    boot_results$fitC_final_status != "success"
+
+  boot_final_T_fail <-
+    boot_results$fitT_final_status != "success"
+
+  boot_final_any_fail <-
+    boot_final_C_fail | boot_final_T_fail
+
+  boot_final_both_fit_ok <-
+    !boot_final_C_fail & !boot_final_T_fail
+
+  boot_functional_fail <-
+    boot_final_both_fit_ok &
+    boot_results$functional_status != "success"
+
+  boot_overall_fail <-
+    boot_results$final_status != "success"
+
+  n_C_fast_rescued <- 0L
+  n_T_fast_rescued <- 0L
+
+  n_C_bfgs_rescued <- sum(
+    boot_after_fast_C_fail & !boot_final_C_fail
+  )
+
+  n_T_bfgs_rescued <- sum(
+    boot_after_fast_T_fail & !boot_final_T_fail
+  )
+
+} else {
+  boot_initial_C_fail <- logical(0)
+  boot_initial_T_fail <- logical(0)
+  boot_initial_any_fail <- logical(0)
+  boot_final_C_fail <- logical(0)
+  boot_final_T_fail <- logical(0)
+  boot_final_any_fail <- logical(0)
+  boot_final_both_fit_ok <- logical(0)
+  boot_functional_fail <- logical(0)
+  boot_overall_fail <- logical(0)
+  boot_after_fast_C_fail <- logical(0)
+  boot_after_fast_T_fail <- logical(0)
+  boot_after_fast_any_fail <- logical(0)
+  boot_bfgs_C_used <- logical(0)
+  boot_bfgs_T_used <- logical(0)
+  n_C_fast_rescued <- 0L
+  n_T_fast_rescued <- 0L
+  n_C_bfgs_rescued <- 0L
+  n_T_bfgs_rescued <- 0L
+}
+
+rescue_change <-
+  mc_results$abs_se_change_rescue_pct[infer_ok]
+rescue_change <-
+  rescue_change[is.finite(rescue_change)]
+
+mean_se_tail_low <- if (n_infer > 0L) {
+  mean(mc_results$se_tail_low[infer_ok])
+} else {
+  NA_real_
+}
+
+mean_se_tail_high <- if (n_infer > 0L) {
+  mean(mc_results$se_tail_high[infer_ok])
+} else {
+  NA_real_
+}
+
+mean_se_tail_split <- if (n_infer > 0L) {
+  mean(mc_results$se_tail_split[infer_ok])
+} else {
+  NA_real_
+}
+
+tail_low_mean_change <- if (is.finite(ASE) && ASE > 0) {
+  100 * (mean_se_tail_low - ASE) / ASE
+} else {
+  NA_real_
+}
+
+tail_high_mean_change <- if (is.finite(ASE) && ASE > 0) {
+  100 * (mean_se_tail_high - ASE) / ASE
+} else {
+  NA_real_
+}
+
+tail_split_mean_change <- if (is.finite(ASE) && ASE > 0) {
+  100 * (mean_se_tail_split - ASE) / ASE
+} else {
+  NA_real_
+}
+
+# Summary
+
+mean_primary_rc_C <- mean(
+  mc_results$primary_right_censor_control_pct,
+  na.rm = TRUE
+)
+
+mean_primary_rc_T <- mean(
+  mc_results$primary_right_censor_treatment_pct,
+  na.rm = TRUE
+)
+
+mean_before_first_C <- mean(
+  mc_results$followup_before_first_visit_control_pct,
+  na.rm = TRUE
+)
+
+mean_before_first_T <- mean(
+  mc_results$followup_before_first_visit_treatment_pct,
+  na.rm = TRUE
+)
+
+mean_sec_left_C <- mean(
+  mc_results$secondary_left_control_pct,
+  na.rm = TRUE
+)
+
+mean_sec_int_C <- mean(
+  mc_results$secondary_interval_control_pct,
+  na.rm = TRUE
+)
+
+mean_sec_right_C <- mean(
+  mc_results$secondary_right_control_pct,
+  na.rm = TRUE
+)
+
+mean_sec_left_T <- mean(
+  mc_results$secondary_left_treatment_pct,
+  na.rm = TRUE
+)
+
+mean_sec_int_T <- mean(
+  mc_results$secondary_interval_treatment_pct,
+  na.rm = TRUE
+)
+
+mean_sec_right_T <- mean(
+  mc_results$secondary_right_treatment_pct,
+  na.rm = TRUE
+)
+
+# Output
+
+summary_results <- data.frame(
+  scenario =
+    "Gumbel + exponential margins + mixed right/interval censoring + terminal primary",
+
+  M_generated = M,
+  B_fixed = B,
+  sample_size_per_arm = size,
+  sieve_k = k.i,
+  tau = tau,
+  tau_lower_secondary = tau_lower,
+
+  copula_parameter_1 = theta,
+  kendall_tau = kendall_tau,
+
+  primary_censor_rate = censor_rate_primary,
+
+  ## Trimmed target
+## Trimmed target
+true_WR = WR_true,
+true_logWR = logWR_true,
+WR_estimate = WR_estimate_trimmed,
+
+n_valid_point_estimates = n_point,
+  n_with_bootstrap_SE = n_infer,
+
+  mean_logWR = mean_logWR,
+  bias_logWR = bias_logWR,
+  ESE_logWR_all = ESE_all,
+  ESE_logWR_inference_subset = ESE_infer,
+  ASE_logWR = ASE,
+  coverage95 = coverage95,
+
+## Untrimmed target, evaluated from the SAME datasets/fits/bootstrap draws
+true_WR_untrimmed = WR_true_untrimmed,
+true_logWR_untrimmed = logWR_true_untrimmed,
+WR_estimate_untrimmed = WR_estimate_untrimmed,
+
+n_valid_point_estimates_untrimmed = n_point_untrimmed,
+  n_with_bootstrap_SE_untrimmed = n_infer_untrimmed,
+
+  mean_logWR_untrimmed = mean_logWR_untrimmed,
+  bias_logWR_untrimmed = bias_logWR_untrimmed,
+  ESE_logWR_all_untrimmed = ESE_all_untrimmed,
+  ESE_logWR_inference_subset_untrimmed = ESE_infer_untrimmed,
+  ASE_logWR_untrimmed = ASE_untrimmed,
+  coverage95_untrimmed = coverage95_untrimmed,
+
+  mean_logWR_difference_untrimmed_minus_trimmed =
+    mean_logWR_difference,
+
+  max_abs_logWR_difference_untrimmed_minus_trimmed =
+    max_abs_logWR_difference,
+
+  mean_primary_right_censor_control_pct =
+    mean_primary_rc_C,
+
+  mean_primary_right_censor_treatment_pct =
+    mean_primary_rc_T,
+
+  mean_followup_before_first_visit_control_pct =
+    mean_before_first_C,
+
+  mean_followup_before_first_visit_treatment_pct =
+    mean_before_first_T,
+
+  mean_secondary_left_control_pct =
+    mean_sec_left_C,
+
+  mean_secondary_interval_control_pct =
+    mean_sec_int_C,
+
+  mean_secondary_right_control_pct =
+    mean_sec_right_C,
+
+  mean_secondary_left_treatment_pct =
+    mean_sec_left_T,
+
+  mean_secondary_interval_treatment_pct =
+    mean_sec_int_T,
+
+  mean_secondary_right_treatment_pct =
+    mean_sec_right_T,
+
+  original_initial_control_fast_failures =
+    sum(orig_initial_C_fail),
+
+  original_initial_treatment_fast_failures =
+    sum(orig_initial_T_fail),
+
+  original_initial_any_fast_failure_pct =
+    100 * mean(orig_initial_any_fail),
+
+  original_control_bfgs_fallback_used =
+    sum(orig_bfgs_C_used),
+
+  original_treatment_bfgs_fallback_used =
+    sum(orig_bfgs_T_used),
+
+  original_control_fit_failures =
+    sum(orig_C_fail),
+
+  original_treatment_fit_failures =
+    sum(orig_T_fail),
+
+  original_any_fit_failures =
+    sum(orig_any_fail),
+
+  original_any_fit_failure_pct =
+    100 * mean(orig_any_fail),
+
+  original_functional_failures =
+    sum(orig_functional_fail),
+
+  bootstrap_total_attempted =
+    nrow(boot_results),
+
+  bootstrap_initial_any_fit_failures =
+    sum(boot_initial_any_fail),
+
+  bootstrap_initial_any_fit_failure_pct =
+    if (length(boot_initial_any_fail) > 0L) {
+      100 * mean(boot_initial_any_fail)
+    } else {
+      NA_real_
+    },
+
+  bootstrap_control_bfgs_fallback_used =
+    sum(boot_bfgs_C_used),
+
+  bootstrap_treatment_bfgs_fallback_used =
+    sum(boot_bfgs_T_used),
+
+  bootstrap_control_bfgs_rescued =
+    n_C_bfgs_rescued,
+
+  bootstrap_treatment_bfgs_rescued =
+    n_T_bfgs_rescued,
+
+  bootstrap_residual_any_fit_failures =
+    sum(boot_final_any_fail),
+
+  bootstrap_residual_any_fit_failure_pct =
+    if (length(boot_final_any_fail) > 0L) {
+      100 * mean(boot_final_any_fail)
+    } else {
+      NA_real_
+    },
+
+  bootstrap_functional_failures =
+    sum(boot_functional_fail),
+
+  bootstrap_overall_unusable =
+    sum(boot_overall_fail),
+
+  bootstrap_overall_unusable_pct =
+    if (length(boot_overall_fail) > 0L) {
+      100 * mean(boot_overall_fail)
+    } else {
+      NA_real_
+    },
+
+  median_abs_SE_change_after_BFGS_pct =
+    if (length(rescue_change) > 0L) {
+      median(rescue_change)
+    } else {
+      NA_real_
+    },
+
+  p95_abs_SE_change_after_BFGS_pct =
+    if (length(rescue_change) > 0L) {
+      as.numeric(quantile(rescue_change, .95))
+    } else {
+      NA_real_
+    },
+
+  max_abs_SE_change_after_BFGS_pct =
+    if (length(rescue_change) > 0L) {
+      max(rescue_change)
+    } else {
+      NA_real_
+    },
+
+  mean_SE_tail_low_change_pct =
+    tail_low_mean_change,
+
+  mean_SE_tail_high_change_pct =
+    tail_high_mean_change,
+
+  mean_SE_tail_split_change_pct =
+    tail_split_mean_change,
+
+  elapsed_seconds =
+    unname((proc.time() - ptm)["elapsed"]),
+
+  stringsAsFactors = FALSE
+)
+
+failure_reasons <- make_failure_reason_table(
+  mc_results,
+  boot_results
+)
+
+## SAVE
+
+performance_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_performance_trimmed_vs_untrimmed.csv")
+)
+
+summary_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_summary.csv")
+)
+
+mc_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_MC_results.csv")
+)
+
+boot_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_bootstrap_diagnostics.csv")
+)
+
+reason_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_failure_reasons.csv")
+)
+
+write.csv(
+  performance_results,
+  performance_file,
+  row.names = FALSE
+)
+
+write.csv(
+  summary_results,
+  summary_file,
+  row.names = FALSE
+)
+
+write.csv(
+  mc_results,
+  mc_file,
+  row.names = FALSE
+)
+
+write.csv(
+  boot_results,
+  boot_file,
+  row.names = FALSE
+)
+
+write.csv(
+  failure_reasons,
+  reason_file,
+  row.names = FALSE
+)
+
+## CONSOLE REPORT
+
+cat("\n============================================================\n")
+cat("FINAL REVISION SIMULATION REPORT\n")
+cat("============================================================\n")
+
+cat("\nScenario:\n")
+cat(summary_results$scenario, "\n")
+
+cat("\nDesign:\n")
+cat("Fixed generated datasets M =", M, "\n")
+cat("Fixed bootstrap draws B    =", B, "\n")
+cat("Sample size per arm         =", size, "\n")
+cat("Sieve dimension k           =", k.i, "\n")
+cat("Analysis horizon tau        =", tau, "\n")
+cat("Gumbel theta              =", theta, "\n")
+cat("Gumbel Kendall tau        =", kendall_tau, "\n")
+cat("Primary censoring C~Exp(rate) =", censor_rate_primary, "\n")
+
+cat("\nAverage censoring pattern across generated datasets:\n")
+cat(
+  "Primary right censoring: control =",
+  round(mean_primary_rc_C, 2), "%; treatment =",
+  round(mean_primary_rc_T, 2), "%\n"
+)
+
+cat(
+  "Observed primary follow-up before first secondary visit: control =",
+  round(mean_before_first_C, 2), "%; treatment =",
+  round(mean_before_first_T, 2), "%\n"
+)
+
+cat(
+  "Secondary control L/I/R =",
+  paste(
+    round(
+      c(
+        mean_sec_left_C,
+        mean_sec_int_C,
+        mean_sec_right_C
+      ),
+      2
+    ),
+    collapse = " / "
+  ),
+  "%\n"
+)
+
+cat(
+  "Secondary treatment L/I/R =",
+  paste(
+    round(
+      c(
+        mean_sec_left_T,
+        mean_sec_int_T,
+        mean_sec_right_T
+      ),
+      2
+    ),
+    collapse = " / "
+  ),
+  "%\n"
+)
+
+cat("\nStatistical performance -- SAME simulation datasets and SAME bootstrap fits:\n")
+print(performance_results, row.names = FALSE)
+
+cat("\nPaired trimmed-vs-untrimmed point-estimate difference:\n")
+cat("Mean [untrimmed - trimmed] log-WR =",
+    mean_logWR_difference, "\n")
+cat("Maximum absolute paired log-WR difference =",
+    max_abs_logWR_difference, "\n")
+
+cat("\nOriginal-fit numerical stability:\n")
+cat(
+  "Initial fast any-arm failures =",
+  sum(orig_initial_any_fail), "of", M,
+  sprintf("(%.2f%%)\n", 100 * mean(orig_initial_any_fail))
+)
+cat(
+  "Softmax/BFGS fallback used: control =",
+  sum(orig_bfgs_C_used), "; treatment =",
+  sum(orig_bfgs_T_used), "\n"
+)
+cat(
+  "Final any-arm fit failures =",
+  sum(orig_any_fail), "of", M,
+  sprintf("(%.2f%%)\n", 100 * mean(orig_any_fail))
+)
+cat("  Final control fit failures   =", sum(orig_C_fail), "\n")
+cat("  Final treatment fit failures =", sum(orig_T_fail), "\n")
+cat(
+  "Downstream WR failures after both fits succeeded =",
+  sum(orig_functional_fail), "\n"
+)
+
+cat("\nWeighted-bootstrap numerical stability:\n")
+cat(
+  "Total fixed multiplier draws attempted =",
+  nrow(boot_results), "\n"
+)
+
+if (nrow(boot_results) > 0L)
+{
+  cat(
+    "Initial any-arm fit failures =",
+    sum(boot_initial_any_fail),
+    sprintf(
+      "(%.2f%%)\n",
+      100 * mean(boot_initial_any_fail)
+    )
+  )
+
+  cat(
+    "Fast-fit failures passed directly to BFGS: control =",
+    sum(boot_initial_C_fail), "; treatment =",
+    sum(boot_initial_T_fail), "\n"
+  )
+
+  cat(
+    "Softmax/BFGS fallback used: control =",
+    sum(boot_bfgs_C_used), "; treatment =",
+    sum(boot_bfgs_T_used), "\n"
+  )
+
+  cat(
+    "  Control softmax/BFGS rescues   =",
+    n_C_bfgs_rescued, "\n"
+  )
+
+  cat(
+    "  Treatment softmax/BFGS rescues =",
+    n_T_bfgs_rescued, "\n"
+  )
+
+  cat(
+    "Residual any-arm fit failures after BFGS fallback =",
+    sum(boot_final_any_fail),
+    sprintf(
+      "(%.2f%%)\n",
+      100 * mean(boot_final_any_fail)
+    )
+  )
+
+  cat(
+    "Downstream WR failures conditional on successful weighted fits =",
+    sum(boot_functional_fail),
+    "of", sum(boot_final_both_fit_ok),
+    "\n"
+  )
+
+  cat(
+    "Overall unusable fixed multiplier draws =",
+    sum(boot_overall_fail),
+    sprintf(
+      "(%.2f%%)\n",
+      100 * mean(boot_overall_fail)
+    )
+  )
+}
+
+cat("\nSensitivity to BFGS-fallback / unresolved draws:\n")
+
+if (length(rescue_change) > 0L)
+{
+  cat(
+    "Median absolute SE change after adding BFGS-fallback draws =",
+    median(rescue_change), "%\n"
+  )
+
+  cat(
+    "95th percentile absolute SE change after BFGS       =",
+    as.numeric(quantile(rescue_change, .95)), "%\n"
+  )
+
+  cat(
+    "Maximum absolute SE change after BFGS               =",
+    max(rescue_change), "%\n"
+  )
+}
+
+cat(
+  "Mean-SE change under lower-tail stress =",
+  tail_low_mean_change, "%\n"
+)
+
+cat(
+  "Mean-SE change under upper-tail stress =",
+  tail_high_mean_change, "%\n"
+)
+
+cat(
+  "Mean-SE change under split-tail stress =",
+  tail_split_mean_change, "%\n"
+)
+
+cat("\nFailure reasons:\n")
+
+if (nrow(failure_reasons) > 0L) {
+  print(failure_reasons)
+} else {
+  cat("No recorded numerical failures.\n")
+}
+
+cat("\nSaved files:\n")
+cat(" ", performance_file, "\n")
+cat(" ", summary_file, "\n")
+cat(" ", mc_file, "\n")
+cat(" ", boot_file, "\n")
+cat(" ", reason_file, "\n")
+
+cat(
+  "\nElapsed time (seconds):",
+  summary_results$elapsed_seconds,
+  "\n"
+)
+
+cat("============================================================\n")

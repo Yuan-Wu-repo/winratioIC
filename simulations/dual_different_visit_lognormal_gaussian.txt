@@ -1,0 +1,2710 @@
+# Gaussian copula + lognormal margins
+# Dual interval censoring with different visit schedules
+# Primary and secondary trimmed comparisons: [tau_lower, tau_analysis]
+
+suppressPackageStartupMessages({
+  library(splines)
+  library(copula)
+  library(foreach)
+  library(doParallel)
+})
+
+# Simulation settings
+
+M <- 500L
+B <- 200L
+NMC_TRUTH <- 5000000L
+output_tag <- "gaussian_diffvisit_lognormal_ratio125_TRIMMED_UNTRIMMED_SAME_SIM_tauL005_tau5_FINAL"
+
+USE_PARALLEL <- TRUE
+N_CORES <- max(1L, parallel::detectCores() - 1L)
+
+OUTPUT_DIR <- getwd()
+
+## Reproducibility
+truth_seed <- 12345L
+simulation_seed <- 20260815L
+
+# Data-generating mechanism
+
+## Lognormal margins.
+## Control medians are matched to the corresponding exponential margins.
+## Treatment medians are set to 1.25 times the control medians for both outcomes,
+## yielding a smaller treatment effect while retaining comparable time scales
+## across marginal families.
+sdlog1 <- 0.7
+sdlog2 <- 0.7
+
+median10 <- log(2) / 0.15       # primary, control
+median11 <- 1.25 * median10     # primary, treatment
+median20 <- log(2) / 0.30       # secondary, control
+median21 <- 1.25 * median20     # secondary, treatment
+
+m10 <- log(median10); s10 <- sdlog1
+m11 <- log(median11); s11 <- sdlog1
+m20 <- log(median20); s20 <- sdlog2
+m21 <- log(median21); s21 <- sdlog2
+## For a Gaussian copula, Kendall's tau = (2/pi) * asin(rho).
+## With rho=0.5, this equals 1/3, matching the other copulas.
+rho <- 0.5
+kendall_tau_gaussian <- (2/pi) * asin(rho)
+
+size <- 200L
+tau_analysis <- 5.0
+## lower endpoint for BOTH the primary and secondary win integrals.
+## Lower endpoint of the visit-time support.
+tau_lower <- 0.05
+tau_lower_untrimmed <- 0.0
+stopifnot(tau_lower > 0, tau_lower < tau_analysis, tau_analysis <= 8)
+
+## Fixed sieve dimension.
+k.i <- 6L
+sk.i <- k.i^2
+
+################################   derivative of the likelihood function  ##############################
+## Includes observation weights.
+gg_pre <- function(qqu_1,qqu_2,qqv_1,qqv_2,
+                   data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                   noze1,noze2,noze3,noze4,noze5,noze6,noze7,noze8,noze9,
+                   sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                   w)
+{
+  ddpre <- matrix(0, (sk.i+2*k.i), 1)
+
+  idx1 <- which(data1!=0); idx2 <- which(data2!=0); idx3 <- which(data3!=0)
+  idx4 <- which(data4!=0); idx5 <- which(data5!=0); idx6 <- which(data6!=0)
+  idx7 <- which(data7!=0); idx8 <- which(data8!=0); idx9 <- which(data9!=0)
+
+  # Weighted score contributions: sum_i w_i * (1/p_i) * dp_i/dtheta
+  mat1 <- qqu_1[,idx1,drop=FALSE] %*% (t(qqu_2[,idx1,drop=FALSE]) * (w[idx1] / sum11[idx1]))
+  mat2 <- qqu_1[,idx2,drop=FALSE] %*% (t(qqv_2[,idx2,drop=FALSE]) * (w[idx2] / sum22[idx2])) -
+    qqu_1[,idx2,drop=FALSE] %*% (t(qqu_2[,idx2,drop=FALSE]) * (w[idx2] / sum22[idx2]))
+  mat3 <- qqu_1[,idx3,drop=FALSE] %*% (matrix(1,noze3,k.i) * (w[idx3] / sum33[idx3])) -
+    qqu_1[,idx3,drop=FALSE] %*% (t(qqv_2[,idx3,drop=FALSE]) * (w[idx3] / sum33[idx3]))
+  mat4 <- qqv_1[,idx4,drop=FALSE] %*% (t(qqu_2[,idx4,drop=FALSE]) * (w[idx4] / sum44[idx4])) -
+    qqu_1[,idx4,drop=FALSE] %*% (t(qqu_2[,idx4,drop=FALSE]) * (w[idx4] / sum44[idx4]))
+  mat5 <- qqv_1[,idx5,drop=FALSE] %*% (t(qqv_2[,idx5,drop=FALSE]) * (w[idx5] / sum55[idx5])) -
+    qqv_1[,idx5,drop=FALSE] %*% (t(qqu_2[,idx5,drop=FALSE]) * (w[idx5] / sum55[idx5])) -
+    qqu_1[,idx5,drop=FALSE] %*% (t(qqv_2[,idx5,drop=FALSE]) * (w[idx5] / sum55[idx5])) +
+    qqu_1[,idx5,drop=FALSE] %*% (t(qqu_2[,idx5,drop=FALSE]) * (w[idx5] / sum55[idx5]))
+  mat6 <- qqv_1[,idx6,drop=FALSE] %*% (matrix(1,noze6,k.i) * (w[idx6] / sum66[idx6])) -
+    qqv_1[,idx6,drop=FALSE] %*% (t(qqv_2[,idx6,drop=FALSE]) * (w[idx6] / sum66[idx6])) -
+    qqu_1[,idx6,drop=FALSE] %*% (matrix(1,noze6,k.i) * (w[idx6] / sum66[idx6])) +
+    qqu_1[,idx6,drop=FALSE] %*% (t(qqv_2[,idx6,drop=FALSE]) * (w[idx6] / sum66[idx6]))
+  mat7 <- (matrix(1,k.i,noze7) - qqv_1[,idx7,drop=FALSE]) %*% (t(qqu_2[,idx7,drop=FALSE]) * (w[idx7] / sum77[idx7]))
+  mat8 <- matrix(1,k.i,noze8) %*% (t(qqv_2[,idx8,drop=FALSE]) * (w[idx8] / sum88[idx8])) -
+    matrix(1,k.i,noze8) %*% (t(qqu_2[,idx8,drop=FALSE]) * (w[idx8] / sum88[idx8])) -
+    qqv_1[,idx8,drop=FALSE] %*% (t(qqv_2[,idx8,drop=FALSE]) * (w[idx8] / sum88[idx8])) +
+    qqv_1[,idx8,drop=FALSE] %*% (t(qqu_2[,idx8,drop=FALSE]) * (w[idx8] / sum88[idx8]))
+  mat9 <- -matrix(1,k.i,noze9) %*% (t(qqv_2[,idx9,drop=FALSE]) * (w[idx9] / sum99[idx9])) -
+    qqv_1[,idx9,drop=FALSE] %*% (matrix(1,noze9,k.i) * (w[idx9] / sum99[idx9])) +
+    qqv_1[,idx9,drop=FALSE] %*% (t(qqv_2[,idx9,drop=FALSE]) * (w[idx9] / sum99[idx9]))
+
+  for (jj in 1:sk.i)
+  {
+    if(as.integer(jj/k.i)==jj/k.i) { m <- jj/k.i; n <- k.i }
+    else { m <- as.integer(jj/k.i)+1; n <- jj-as.integer(jj/k.i)*k.i }
+    ddpre[jj,1] <- mat1[m,n]+mat2[m,n]+mat3[m,n]+mat4[m,n]+mat5[m,n]+mat6[m,n]+mat7[m,n]+mat8[m,n]+mat9[m,n]
+  }
+
+  vec7 <- matrix(1,1,noze7) %*% (t(qqu_2[,idx7,drop=FALSE]) * (w[idx7] / sum77[idx7]))
+  vec8 <- matrix(1,1,noze8) %*% (t(qqv_2[,idx8,drop=FALSE]) * (w[idx8] / sum88[idx8])) -
+    matrix(1,1,noze8) %*% (t(qqu_2[,idx8,drop=FALSE]) * (w[idx8] / sum88[idx8]))
+  vec9 <- -matrix(1,1,noze9) %*% (t(qqv_2[,idx9,drop=FALSE]) * (w[idx9] / sum99[idx9]))
+
+  for (jj in (sk.i+1):(sk.i+k.i))
+  {
+    n <- jj-sk.i
+    ddpre[jj,1] <- vec7[n]+vec8[n]+vec9[n]
+  }
+
+  vec3 <- qqu_1[,idx3,drop=FALSE] %*% (matrix(1,noze3,1) * (w[idx3] / sum33[idx3]))
+  vec6 <- qqv_1[,idx6,drop=FALSE] %*% (matrix(1,noze6,1) * (w[idx6] / sum66[idx6])) -
+    qqu_1[,idx6,drop=FALSE] %*% (matrix(1,noze6,1) * (w[idx6] / sum66[idx6]))
+  vec9 <- -qqv_1[,idx9,drop=FALSE] %*% (matrix(1,noze9,1) * (w[idx9] / sum99[idx9]))
+
+  for (jj in (sk.i+k.i+1):(sk.i+2*k.i))
+  {
+    m <- jj-(sk.i+k.i)
+    ddpre[jj,1] <- vec3[m]+vec6[m]+vec9[m]
+  }
+
+  ddpre
+}
+
+########################## hessian matrix of the likelihood function  ###########################
+## Includes observation weights.
+hh_pre <- function(qqu_1,qqu_2,qqv_1,qqv_2,
+                   data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                   sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                   mat11,mat22,mat33,mat44,mat55,mat66,mat77,mat88,mat99,
+                   vec77,vec88,vec99,vec33,vec66,vec99new,
+                   w)
+{
+  hhpre <- matrix(0, (sk.i+2*k.i), (sk.i+2*k.i))
+
+  idx1 <- which(data1!=0); idx2 <- which(data2!=0); idx3 <- which(data3!=0)
+  idx4 <- which(data4!=0); idx5 <- which(data5!=0); idx6 <- which(data6!=0)
+  idx7 <- which(data7!=0); idx8 <- which(data8!=0); idx9 <- which(data9!=0)
+
+  # Weighted Hessian: - sum_i w_i * (grad p_i)(grad p_i)^T / p_i^2
+  ww11 <- w[idx1]/(sum11[idx1]^2)
+  ww22 <- w[idx2]/(sum22[idx2]^2)
+  ww33 <- w[idx3]/(sum33[idx3]^2)
+  ww44 <- w[idx4]/(sum44[idx4]^2)
+  ww55 <- w[idx5]/(sum55[idx5]^2)
+  ww66 <- w[idx6]/(sum66[idx6]^2)
+  ww77 <- w[idx7]/(sum77[idx7]^2)
+  ww88 <- w[idx8]/(sum88[idx8]^2)
+  ww99 <- w[idx9]/(sum99[idx9]^2)
+
+  mat111 <- mat11 %*% (t(mat11) * ww11)
+  mat222 <- mat22 %*% (t(mat22) * ww22)
+  mat333 <- mat33 %*% (t(mat33) * ww33)
+  mat444 <- mat44 %*% (t(mat44) * ww44)
+  mat555 <- mat55 %*% (t(mat55) * ww55)
+  mat666 <- mat66 %*% (t(mat66) * ww66)
+  mat777 <- mat77 %*% (t(mat77) * ww77)
+  mat888 <- mat88 %*% (t(mat88) * ww88)
+  mat999 <- mat99 %*% (t(mat99) * ww99)
+
+  for(ii in 1:sk.i)
+    for(jj in ii:sk.i)
+      hhpre[ii,jj] <- -mat111[ii,jj]-mat222[ii,jj]-mat333[ii,jj]-mat444[ii,jj]-mat555[ii,jj]-mat666[ii,jj]-mat777[ii,jj]-mat888[ii,jj]-mat999[ii,jj]
+
+  vec777 <- mat77 %*% (t(vec77) * ww77)
+  vec888 <- mat88 %*% (t(vec88) * ww88)
+  vec999 <- mat99 %*% (t(vec99) * ww99)
+
+  for (ii in 1:sk.i)
+    for (jj in (sk.i+1):(sk.i+k.i))
+      hhpre[ii,jj] <- -vec777[ii, jj-sk.i]-vec888[ii, jj-sk.i]-vec999[ii, jj-sk.i]
+
+  vec333 <- mat33 %*% (t(vec33) * ww33)
+  vec666 <- mat66 %*% (t(vec66) * ww66)
+  vec999b <- mat99 %*% (t(vec99new) * ww99)
+
+  for (ii in 1:sk.i)
+    for (jj in (sk.i+k.i+1):(sk.i+2*k.i))
+      hhpre[ii,jj] <- -vec333[ii, jj-sk.i-k.i]-vec666[ii, jj-sk.i-k.i]-vec999b[ii, jj-sk.i-k.i]
+
+  vec7772 <- vec77 %*% (t(vec77) * ww77)
+  vec8882 <- vec88 %*% (t(vec88) * ww88)
+  vec9992 <- vec99 %*% (t(vec99) * ww99)
+
+  for (ii in (sk.i+1):(sk.i+k.i))
+    for (jj in ii:(sk.i+k.i))
+      hhpre[ii,jj] <- -vec7772[ii-sk.i, jj-sk.i]-vec8882[ii-sk.i, jj-sk.i]-vec9992[ii-sk.i, jj-sk.i]
+
+  vec9993 <- vec99 %*% (t(vec99new) * ww99)
+  for (ii in (sk.i+1):(sk.i+k.i))
+    for (jj in (sk.i+k.i+1):(sk.i+2*k.i))
+      hhpre[ii,jj] <- -vec9993[ii-sk.i, jj-sk.i-k.i]
+
+  vec3333 <- vec33 %*% (t(vec33) * ww33)
+  vec6663 <- vec66 %*% (t(vec66) * ww66)
+  vec9994 <- vec99new %*% (t(vec99new) * ww99)
+
+  for (ii in (sk.i+k.i+1):(sk.i+2*k.i))
+    for (jj in ii:(sk.i+2*k.i))
+      hhpre[ii,jj] <- -vec3333[ii-sk.i-k.i, jj-sk.i-k.i]-vec6663[ii-sk.i-k.i, jj-sk.i-k.i]-vec9994[ii-sk.i-k.i, jj-sk.i-k.i]
+
+  # symmetrize
+  hhpre <- hhpre + t(hhpre)
+  for (ii in 1:(sk.i+2*k.i)) hhpre[ii,ii] <- hhpre[ii,ii]/2
+  hhpre
+}
+
+################### knot sequence of spline functions ####################################
+get_knots <- function(tu_1,tu_2,tv_1,tv_2,
+                      delta1_1,delta2_1,delta3_1,
+                      delta1_2,delta2_2,delta3_2)
+{
+  err <- 0.5
+
+  knot_pre_1 <- c(tu_1[delta1_1!=0], tu_1[delta2_1!=0],
+                  tv_1[delta2_1!=0], tv_1[delta3_1!=0])
+  knot_pre_2 <- c(tu_2[delta1_2!=0], tu_2[delta2_2!=0],
+                  tv_2[delta2_2!=0], tv_2[delta3_2!=0])
+
+  ## Original rule has k.i - 3 interior knots at fractions
+  ## 1/(k.i-2), ..., (k.i-3)/(k.i-2).
+  probs <- seq_len(k.i - 3L) / (k.i - 2L)
+
+  interior1 <- as.numeric(quantile(knot_pre_1, probs = probs, names = FALSE))
+  interior2 <- as.numeric(quantile(knot_pre_2, probs = probs, names = FALSE))
+
+  ## boundary must contain every x passed to splineDesign.
+  upper1 <- max(c(tu_1, tv_1, tau_analysis), na.rm = TRUE) + err
+  upper2 <- max(c(tu_2, tv_2, tau_analysis), na.rm = TRUE) + err
+
+  knot1 <- c(rep(0, 3), interior1, rep(upper1, 3))
+  knot2 <- c(rep(0, 3), interior2, rep(upper2, 3))
+
+  stopifnot(length(knot1) == k.i + 3L,
+            length(knot2) == k.i + 3L)
+
+  list(knot1 = knot1, knot2 = knot2)
+}
+
+##  Gaussian simulation + lognormal margins
+get_time <- function(rho, meanlog1, sdlog1, meanlog2, sdlog2)
+{
+  stopifnot(is.finite(rho), abs(rho) < 1)
+  gc <- copula::normalCopula(
+    param = rho,
+    dim = 2,
+    dispstr = "un"
+  )
+  v  <- copula::rCopula(size, gc)
+  x1 <- qlnorm(v[,1], meanlog = meanlog1, sdlog = sdlog1)
+  x2 <- qlnorm(v[,2], meanlog = meanlog2, sdlog = sdlog2)
+  list(x1=x1, x2=x2)
+}
+
+# convert matrix(alpha_ij) + marginal terms into the 9 cell probabilities
+sumvectorfunction <- function(alpha,qqu_1,qqu_2,qqv_1,qqv_2)
+{
+  sumuu=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumuu=sumuu+alpha[(i-1)*k.i+j,1]*qqu_1[i,]*qqu_2[j,]
+  sumuv=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumuv=sumuv+alpha[(i-1)*k.i+j,1]*qqu_1[i,]*qqv_2[j,]
+  sumvu=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumvu=sumvu+alpha[(i-1)*k.i+j,1]*qqv_1[i,]*qqu_2[j,]
+  sumvv=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumvv=sumvv+alpha[(i-1)*k.i+j,1]*qqv_1[i,]*qqv_2[j,]
+
+  sumu2=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumu2=sumu2+alpha[(i-1)*k.i+j,1]*qqu_2[j,]
+  sumv2=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumv2=sumv2+alpha[(i-1)*k.i+j,1]*qqv_2[j,]
+  sumu1=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumu1=sumu1+alpha[(i-1)*k.i+j,1]*qqu_1[i,]
+  sumv1=rep(0,size)
+  for(i in 1:k.i) for(j in 1:k.i) sumv1=sumv1+alpha[(i-1)*k.i+j,1]*qqv_1[i,]
+
+  sumu2m=rep(0,size)
+  for(i in 1:k.i) sumu2m=sumu2m+alpha[(sk.i)+i,1]*qqu_2[i,]
+  sumv2m=rep(0,size)
+  for(i in 1:k.i) sumv2m=sumv2m+alpha[(sk.i)+i,1]*qqv_2[i,]
+  sumu1m=rep(0,size)
+  for(i in 1:k.i) sumu1m=sumu1m+alpha[(sk.i+k.i)+i,1]*qqu_1[i,]
+  sumv1m=rep(0,size)
+  for(i in 1:k.i) sumv1m=sumv1m+alpha[(sk.i+k.i)+i,1]*qqv_1[i,]
+
+  sum11<-sumuu
+  sum22<-sumuv-sumuu
+  sum33<-(sumu1+sumu1m)-sumuv
+  sum44<-sumvu-sumuu
+  sum55<-sumvv-sumvu-sumuv+sumuu
+  sum66<-(sumv1+sumv1m)-sumvv-(sumu1+sumu1m)+sumuv
+  sum77<-(sumu2+sumu2m)-sumvu
+  sum88<-(sumv2+sumv2m)-(sumu2+sumu2m)-sumvv+sumvu
+  sum99<-1-(sumv2+sumv2m)-(sumv1+sumv1m)+sumvv
+
+  list(sum11=sum11,sum22=sum22,sum33=sum33,sum44=sum44,sum55=sum55,sum66=sum66,sum77=sum77,sum88=sum88,sum99=sum99)
+}
+
+## NOTE: includes weights w (length=size).
+sumfunction <- function(sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                        data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                        w)
+{
+  probs <- list(sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99)
+  dats  <- list(data1,data2,data3,data4,data5,data6,data7,data8,data9)
+
+  total <- 0
+  for (j in seq_along(probs)) {
+    idx <- dats[[j]] != 0
+    if (!any(idx)) next
+    pj <- probs[[j]][idx]
+    if (any(!is.finite(pj)) || any(pj <= 0)) return(-Inf)
+    total <- total + sum(w[idx] * log(pj))
+  }
+  total
+}
+
+##  VISIT PROCESS: DIFFERENT INDEPENDENT SCHEDULES
+##
+##  Controlled comparison with the SAME-visit scenario:
+##    - each outcome has exactly two monitoring times;
+##    - for each outcome, two candidate times are iid U(0.05, 8);
+##    - they are ordered as (tu, tv) and required to differ by > 0.05;
+##    - the primary and secondary schedules are generated independently.
+##
+##  Thus the marginal visit-time distribution and marginal censoring
+##  severity are preserved; only cross-outcome visit alignment changes.
+##  Visit times are generated independently of event times.
+
+draw_two_visits <- function() {
+  repeat {
+    a <- runif(1, 0.05, 8.0)
+    b <- runif(1, 0.05, 8.0)
+    if (abs(b - a) > 0.05) {
+      return(c(tu = min(a, b), tv = max(a, b)))
+    }
+  }
+}
+
+from.event.to.censor <- function(size, x1, x2) {
+
+  tu_1 <- rep(0, size); tv_1 <- rep(0, size)
+  tu_2 <- rep(0, size); tv_2 <- rep(0, size)
+
+  delta1_1 <- delta2_1 <- delta3_1 <- rep(0, size)
+  delta1_2 <- delta2_2 <- delta3_2 <- rep(0, size)
+
+  for (k in seq_len(size)) {
+    ## Outcome 1 schedule
+    vis1 <- draw_two_visits()
+    tu_1[k] <- vis1["tu"]
+    tv_1[k] <- vis1["tv"]
+
+    ## Outcome 2 schedule -- independent of outcome 1 schedule
+    vis2 <- draw_two_visits()
+    tu_2[k] <- vis2["tu"]
+    tv_2[k] <- vis2["tv"]
+  }
+
+  for (k in seq_len(size)) {
+    if (x1[k] <= tu_1[k]) {
+      delta1_1[k] <- 1
+    } else if (x1[k] <= tv_1[k]) {
+      delta2_1[k] <- 1
+    } else {
+      delta3_1[k] <- 1
+    }
+
+    if (x2[k] <= tu_2[k]) {
+      delta1_2[k] <- 1
+    } else if (x2[k] <= tv_2[k]) {
+      delta2_2[k] <- 1
+    } else {
+      delta3_2[k] <- 1
+    }
+  }
+
+  list(
+    tu_1 = tu_1, tu_2 = tu_2,
+    tv_1 = tv_1, tv_2 = tv_2,
+    delta1_1 = delta1_1, delta2_1 = delta2_1, delta3_1 = delta3_1,
+    delta1_2 = delta1_2, delta2_2 = delta2_2, delta3_2 = delta3_2
+  )
+}
+
+## NOTE: totest takes weights w (default all 1s) and passes into sumfunction/gg_pre/hh_pre
+totest_diag <- function(tu_1,tu_2,tv_1,tv_2,
+                   delta1_1,delta2_1,delta3_1,delta1_2,delta2_2,delta3_2,
+                   w = rep(1, size),
+                   alpha_init = NULL,
+                   max_halvings = 10L)
+{
+  knot12 <- get_knots(tu_1,tu_2,tv_1,tv_2,delta1_1,delta2_1,delta3_1,delta1_2,delta2_2,delta3_2)
+  knot1 <- knot12$knot1
+  knot2 <- knot12$knot2
+
+  # I-splines via B-splines
+  bsp <- t(splineDesign(knots = c(0, knot1, max(knot1)), x = tu_1, ord = 4))
+  pre.isp <- apply(bsp, 2, rev); isp <- apply(pre.isp, 2, cumsum); isp <- apply(isp, 2 ,rev); isp <- isp[-1,]
+  qqu_1 <- isp
+
+  bsp <- t(splineDesign(knots = c(0, knot1, max(knot1)), x = tv_1, ord = 4))
+  pre.isp <- apply(bsp, 2, rev); isp <- apply(pre.isp, 2, cumsum); isp <- apply(isp, 2 ,rev); isp <- isp[-1,]
+  qqv_1 <- isp
+
+  bsp <- t(splineDesign(knots = c(0, knot2, max(knot2)), x = tu_2, ord = 4))
+  pre.isp <- apply(bsp, 2, rev); isp <- apply(pre.isp, 2, cumsum); isp <- apply(isp, 2 ,rev); isp <- isp[-1,]
+  qqu_2 <- isp
+
+  bsp <- t(splineDesign(knots = c(0, knot2, max(knot2)), x = tv_2, ord = 4))
+  pre.isp <- apply(bsp, 2, rev); isp <- apply(pre.isp, 2, cumsum); isp <- apply(isp, 2 ,rev); isp <- isp[-1,]
+  qqv_2 <- isp
+
+  data1 <- delta1_1*delta1_2
+  data2 <- delta1_1*delta2_2
+  data3 <- delta1_1*delta3_2
+  data4 <- delta2_1*delta1_2
+  data5 <- delta2_1*delta2_2
+  data6 <- delta2_1*delta3_2
+  data7 <- delta3_1*delta1_2
+  data8 <- delta3_1*delta2_2
+  data9 <- delta3_1*delta3_2
+
+  noze1 <- sum(data1); noze2 <- sum(data2); noze3 <- sum(data3)
+  noze4 <- sum(data4); noze5 <- sum(data5); noze6 <- sum(data6)
+  noze7 <- sum(data7); noze8 <- sum(data8); noze9 <- sum(data9)
+
+  mat11 <- matrix(0,sk.i,noze1); mat22 <- matrix(0,sk.i,noze2); mat33 <- matrix(0,sk.i,noze3)
+  mat44 <- matrix(0,sk.i,noze4); mat55 <- matrix(0,sk.i,noze5); mat66 <- matrix(0,sk.i,noze6)
+  mat77 <- matrix(0,sk.i,noze7); mat88 <- matrix(0,sk.i,noze8); mat99 <- matrix(0,sk.i,noze9)
+
+  for (ii in 1:sk.i)
+  {
+    if(as.integer(ii/k.i)==ii/k.i) { m1=ii/k.i; n1=k.i }
+    else { m1=as.integer(ii/k.i)+1; n1=ii-as.integer(ii/k.i)*k.i }
+
+    mat11[ii,] <- qqu_1[m1,data1!=0]*qqu_2[n1,data1!=0]
+    mat22[ii,] <- qqu_1[m1,data2!=0]*qqv_2[n1,data2!=0]-qqu_1[m1,data2!=0]*qqu_2[n1,data2!=0]
+    mat33[ii,] <- qqu_1[m1,data3!=0]-qqu_1[m1,data3!=0]*qqv_2[n1,data3!=0]
+    mat44[ii,] <- qqv_1[m1,data4!=0]*qqu_2[n1,data4!=0]-qqu_1[m1,data4!=0]*qqu_2[n1,data4!=0]
+    mat55[ii,] <- qqv_1[m1,data5!=0]*qqv_2[n1,data5!=0]-qqv_1[m1,data5!=0]*qqu_2[n1,data5!=0]-
+      qqu_1[m1,data5!=0]*qqv_2[n1,data5!=0]+qqu_1[m1,data5!=0]*qqu_2[n1,data5!=0]
+    mat66[ii,] <- qqv_1[m1,data6!=0]-qqv_1[m1,data6!=0]*qqv_2[n1,data6!=0]-qqu_1[m1,data6!=0]+qqu_1[m1,data6!=0]*qqv_2[n1,data6!=0]
+    mat77[ii,] <- qqu_2[n1,data7!=0]-qqv_1[m1,data7!=0]*qqu_2[n1,data7!=0]
+    mat88[ii,] <- qqv_2[n1,data8!=0]-qqu_2[n1,data8!=0]-qqv_1[m1,data8!=0]*qqv_2[n1,data8!=0]+qqv_1[m1,data8!=0]*qqu_2[n1,data8!=0]
+    mat99[ii,] <- -qqv_2[n1,data9!=0]-qqv_1[m1,data9!=0]+qqv_1[m1,data9!=0]*qqv_2[n1,data9!=0]
+  }
+
+  vec77 <- qqu_2[,data7!=0,drop=FALSE]
+  vec88 <- qqv_2[,data8!=0,drop=FALSE]-qqu_2[,data8!=0,drop=FALSE]
+  vec99 <- -qqv_2[,data9!=0,drop=FALSE]
+
+  vec33 <- qqu_1[,data3!=0,drop=FALSE]
+  vec66 <- qqv_1[,data6!=0,drop=FALSE]-qqu_1[,data6!=0,drop=FALSE]
+  vec99new <- -qqv_1[,data9!=0,drop=FALSE]
+
+  ## Starting value.  The original fit uses the original generic interior
+  ## start.  Weighted-bootstrap refits may instead be warm-started from a
+  ## slightly interiorized version of the original unweighted MLE.
+  p_alpha <- sk.i + 2*k.i
+  if (is.null(alpha_init)) {
+    alpha <- matrix(0.5/p_alpha, p_alpha, 1)
+  } else {
+    avec <- as.numeric(alpha_init)
+    if (length(avec) != p_alpha || any(!is.finite(avec)))
+      stop("Invalid alpha_init")
+    alpha <- matrix(avec, p_alpha, 1)
+    ## Numerical safeguard only: keep the supplied start feasible.
+    alpha[alpha < 0] <- 0
+    if (sum(alpha) >= 1) alpha <- alpha / sum(alpha) * (1 - 1e-10)
+  }
+
+  sumvector <- sumvectorfunction(alpha,qqu_1,qqu_2,qqv_1,qqv_2)
+  sum11 <- sumvector$sum11; sum22 <- sumvector$sum22; sum33 <- sumvector$sum33
+  sum44 <- sumvector$sum44; sum55 <- sumvector$sum55; sum66 <- sumvector$sum66
+  sum77 <- sumvector$sum77; sum88 <- sumvector$sum88; sum99 <- sumvector$sum99
+
+  summl1 <- sumfunction(sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                        data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                        w)
+
+  dd <- gg_pre(qqu_1,qqu_2,qqv_1,qqv_2,
+               data1,data2,data3,data4,data5,data6,data7,data8,data9,
+               noze1,noze2,noze3,noze4,noze5,noze6,noze7,noze8,noze9,
+               sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+               w)
+
+  hhh <- hh_pre(qqu_1,qqu_2,qqv_1,qqv_2,
+                data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                mat11,mat22,mat33,mat44,mat55,mat66,mat77,mat88,mat99,
+                vec77,vec88,vec99,vec33,vec66,vec99new,
+                w)
+
+  # original generalized gradient-projection algorithm with implementation safeguards
+  index=0
+  rowa1<--1
+  rowa=0
+  whilecheck<-0
+  kk=-1
+  kk1=1
+  kk2=1
+  stop=0
+  fail_reason <- "success"
+  fail_detail <- NA_character_
+
+  while(rowa1!=rowa)
+  {
+    if (whilecheck==0)
+    {
+      whilecheck<-1
+      hreg <- -hhh + diag(0.01, (sk.i+2*k.i))
+      kk1 <- rcond(hreg)
+      if (!is.finite(kk1) || kk1 < 10^(-15)) {
+        fail_reason <- "hessian_ill_conditioned"
+        fail_detail <- paste0("initial rcond=", kk1)
+        stop <- 1
+        break
+      }
+      ww <- solve(hreg)
+      gt=ww%*%dd
+      rowa=0
+      pw=diag(1,(sk.i+2*k.i))
+      ddd=pw%*%gt
+      for(i in 1:(sk.i+2*k.i)) if (abs(ddd[i])<10^(-7)/5) ddd[i]=0
+    } else {
+      ## FIX 2a: aa exists only when the active set is nonempty.
+      if (rowa > 0) {
+        amat <- aa %*% ww %*% t(aa)
+        kk2 <- rcond(amat)
+        if (!is.finite(kk2) || kk2 < 10^(-15)) {
+          fail_reason <- "active_set_ill_conditioned"
+          fail_detail <- paste0("rcond=", kk2)
+          stop <- 1
+          break
+        }
+        pw <- diag(1,(sk.i+2*k.i)) -
+              ww %*% t(aa) %*% solve(amat) %*% aa
+      } else {
+        pw <- diag(1,(sk.i+2*k.i))
+      }
+      ddd=pw%*%gt
+      for(i in 1:(sk.i+2*k.i)) if (abs(ddd[i])<10^(-7)/5) ddd[i]=0
+    }
+
+    while(max(abs(ddd))>0.0001)
+    {
+      iiii=0; tep=0; tep1=0
+      sumc=sum(alpha); sumd=sum(ddd)
+
+      if(1-sumc>0.0000001&sumd>0.0000001)
+      {
+        iiii=iiii+1
+        tep[iiii]=(1-sumc)/sumd
+        tep1[iiii]=-1
+      }
+
+      for( i in 1:(k.i))
+      {
+        for( j in 1:(k.i))
+        {
+          if (alpha[(i-1)*k.i+j]>0.0000001&ddd[(i-1)*k.i+j]<0)
+          {
+            iiii=iiii+1
+            tep[iiii]=(0.0000001-alpha[(i-1)*k.i+j])/ddd[(i-1)*k.i+j]
+            tep1[iiii]=(i-1)*k.i+j
+          }
+        }
+      }
+
+      for(i in (sk.i+1):(sk.i+2*k.i))
+      {
+        if(alpha[i]>0&ddd[i]<0)
+        {
+          iiii=iiii+1
+          tep[iiii]=-alpha[i]/ddd[i]
+          tep1[iiii]=i
+        }
+      }
+
+      rrtt=tep[1]; kkkk=1
+      if(iiii>0) { rrtt=min(tep); kkkk=which.min(tep) }
+      rrtt=min(rrtt,0.5)
+
+      summl2=summl1-1; kk=-1
+      while(summl2<=summl1 & kk<=max_halvings)
+      {
+        kk=kk+1
+        alphat=alpha+0.5^kk*rrtt*ddd
+        if (sum(alphat)>1+10^(-5)) { fail_reason <- "mass_constraint_violation"; fail_detail <- paste0("sum(alphat)=", sum(alphat)); stop=1; break }
+
+        u1=tep1[kkkk]; k5=0; add=0
+        if(u1!=-1&kk==0&tep[kkkk]<=0.5)
+        {
+          if(u1>sk.i) alphat[u1]=0 else alphat[u1]=0.0000001
+
+          for(i in 1:(sk.i+2*k.i))
+          {
+            if(((alphat[i]<10^(-8))||(abs(alphat[i]-10^(-7))<10^(-8)&i<=sk.i))&i!=tep1[kkkk])
+            {
+              if(!any(index==i)) { k5=k5+1; add[k5]=i }
+            }
+          }
+        }
+
+        for(i in 1:(sk.i+2*k.i)) if(alphat[i]<10^(-8)) alphat[i]=0
+
+        sumvector <- sumvectorfunction(alphat,qqu_1,qqu_2,qqv_1,qqv_2)
+        sum11 <- sumvector$sum11; sum22 <- sumvector$sum22; sum33 <- sumvector$sum33
+        sum44 <- sumvector$sum44; sum55 <- sumvector$sum55; sum66 <- sumvector$sum66
+        sum77 <- sumvector$sum77; sum88 <- sumvector$sum88; sum99 <- sumvector$sum99
+
+        summl2 <- sumfunction(sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                              data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                              w)
+
+        if(summl2==Inf) { fail_reason <- "trial_loglik_posInf"; fail_detail <- "summl2 == Inf"; stop=1; break }
+      }
+      if (stop==1) break
+      if (kk>max_halvings) {
+        fail_reason <- "line_search_failure"
+        fail_detail <- paste0("No likelihood increase after >", max_halvings, " step halvings")
+        stop=1
+        break
+      }
+
+      if(kk==0&tep[kkkk]<=0.5)
+      {
+        rowa=rowa+1
+        index[rowa]=tep1[kkkk]
+        anew=matrix(0,1,(sk.i+2*k.i))
+
+        if(tep1[kkkk]==(-1)) { for(i in 1:(sk.i+2*k.i)) anew[1,i]=1 }
+        else { anew[1,tep1[kkkk]]=-1 }
+
+        if(rowa==1) aa=anew
+        if(rowa>1) aa=rbind(aa,anew)
+
+        if(k5!=0)
+        {
+          for(i in 1:k5) index[rowa+i]=add[i]
+          rowa=rowa+k5
+
+          anew=matrix(0,k5,(sk.i+2*k.i))
+          for(i in 1:k5) anew[i,add[i]]=-1
+          aa=rbind(aa,anew)
+        }
+      }
+
+      alpha=alphat
+
+      sumvector <- sumvectorfunction(alpha,qqu_1,qqu_2,qqv_1,qqv_2)
+      sum11 <- sumvector$sum11; sum22 <- sumvector$sum22; sum33 <- sumvector$sum33
+      sum44 <- sumvector$sum44; sum55 <- sumvector$sum55; sum66 <- sumvector$sum66
+      sum77 <- sumvector$sum77; sum88 <- sumvector$sum88; sum99 <- sumvector$sum99
+
+      summl1 <- sumfunction(sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                            data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                            w)
+
+      dd <- gg_pre(qqu_1,qqu_2,qqv_1,qqv_2,
+                   data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                   noze1,noze2,noze3,noze4,noze5,noze6,noze7,noze8,noze9,
+                   sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                   w)
+
+      hhh <- hh_pre(qqu_1,qqu_2,qqv_1,qqv_2,
+                    data1,data2,data3,data4,data5,data6,data7,data8,data9,
+                    sum11,sum22,sum33,sum44,sum55,sum66,sum77,sum88,sum99,
+                    mat11,mat22,mat33,mat44,mat55,mat66,mat77,mat88,mat99,
+                    vec77,vec88,vec99,vec33,vec66,vec99new,
+                    w)
+
+      kk1 <- rcond(-hhh+diag(0.01, (sk.i+2*k.i)))
+      if(kk1<10^(-15)) { fail_reason <- "hessian_ill_conditioned"; fail_detail <- paste0("rcond=", kk1); stop=1; break }
+      ww <- solve(-hhh+diag(0.01, (sk.i+2*k.i)))
+
+      gt <- ww%*%dd
+
+      ## do not evaluate an active-set matrix when rowa == 0.
+      if (rowa > 0) {
+        amat <- aa %*% ww %*% t(aa)
+        kk2 <- rcond(amat)
+        if (!is.finite(kk2) || kk2 < 10^(-15)) {
+          fail_reason <- "active_set_ill_conditioned"
+          fail_detail <- paste0("rcond=", kk2)
+          stop <- 1
+          break
+        }
+        pw <- diag(1,(sk.i+2*k.i)) -
+              ww %*% t(aa) %*% solve(amat) %*% aa
+      } else {
+        pw <- diag(1,(sk.i+2*k.i))
+      }
+      ddd <- pw%*%gt
+      for(i in 1:(sk.i+2*k.i)) if (abs(ddd[i])<10^(-7)/5) ddd[i]=0
+    }
+
+    if (stop==1) break
+
+    ## Lagrange multipliers are defined only for a nonempty
+    ## active set.  If rowa == 0 there is no aa and no multiplier to compute.
+    rowa1 <- rowa
+    if (rowa > 0) {
+      amat <- aa %*% ww %*% t(aa)
+      kk2 <- rcond(amat)
+      if (!is.finite(kk2) || kk2 < 10^(-15)) {
+        fail_reason <- "active_set_ill_conditioned"
+        fail_detail <- paste0("rcond=", kk2)
+        stop <- 1
+        break
+      }
+      lambda <- solve(amat) %*% aa %*% gt
+
+      if (rowa > 1 && min(lambda) < 0)
+      {
+        rowa=rowa-1
+        ik=which.min(lambda)
+        index=index[-ik]
+        if (rowa>1) aa=aa[-ik,]
+        else { if(rowa==1) aa=t(aa[-ik,]) }
+      }
+    }
+  }
+
+  if (stop==0) {
+    list(alpha = alpha, knot1 = knot1, knot2 = knot2,
+         status = "success", detail = NA_character_)
+  } else {
+    list(alpha = -9999, knot1 = -9999, knot2 = -9999,
+         status = fail_reason, detail = fail_detail)
+  }
+}
+
+############### Win probability estimators###############
+mar.surv1 <- function(t1, knot11, alpha.joint.1, alpha.mar.1.1)
+{
+  knotb <- c(0, knot11, max(knot11))
+  bsp <- t(splineDesign(knots = knotb, x = t1, ord = 4))
+  pre.isp <- rev(bsp); isp <- cumsum(pre.isp); isp <- rev(isp); isp <- isp[-1]
+  q1 <- isp
+
+  tep_matrix <- matrix(c(alpha.joint.1),k.i,k.i)
+  tep_q1 <- matrix(q1, 1, k.i)
+  sum1 <- tep_q1 %*% t(tep_matrix)
+  sum2 <- alpha.mar.1.1 * tep_q1
+  1 - (sum(sum1) + sum(sum2))
+}
+
+mar.dcdf0 <- function(t1, knot01, alpha.joint.0, alpha.mar.0.1)
+{
+  knotb <- knot01
+  ord <- 3
+  bsp <- t(splineDesign(knots = knotb, x = t1, ord = ord))
+  msp <- bsp / (knotb[(1 + ord) : (k.i + ord)] - knotb[1 : k.i]) * 3
+  q1 <- msp
+
+  tep_matrix <- matrix(c(alpha.joint.0),k.i,k.i)
+  tep_q1 <- matrix(q1, 1, k.i)
+  sum1 <- tep_q1 %*% t(tep_matrix)
+  sum2 <- alpha.mar.0.1 * tep_q1
+  sum(sum1) + sum(sum2)
+}
+
+mar.multip <- function(t, knot01, knot11, alpha.joint.0, alpha.mar.0.1, alpha.joint.1, alpha.mar.1.1)
+{
+  mar.surv1(t, knot11, alpha.joint.1, alpha.mar.1.1) * mar.dcdf0(t, knot01, alpha.joint.0, alpha.mar.0.1)
+}
+
+est.win.ratio1 <- function(knot01, knot11, alpha.joint.0, alpha.mar.0.1, alpha.joint.1, alpha.mar.1.1,
+                           tau_l = tau_lower)
+{
+  ## Trimmed primary comparison [tau_l, tau].
+  ## tau_l=0 is allowed ONLY for exploratory paired comparisons.
+  start <- tau_l
+  end <- min(max(knot01), max(knot11), tau_analysis)
+  parts <- 1000
+  dif <- (end - start) / parts
+  integrate.vec <- sapply(1 : parts, function(ind) mar.multip((start + ind * dif),
+                                                             knot01, knot11, alpha.joint.0, alpha.mar.0.1, alpha.joint.1, alpha.mar.1.1) * dif)
+  sum(integrate.vec)
+}
+
+## Evaluate the I-spline CDF basis at a scalar time (consistent with the likelihood).
+get_I_basis <- function(t, knot) {
+  bsp <- as.numeric(splines::splineDesign(
+    knots = c(0, knot, max(knot)), x = t, ord = 4
+  ))
+  rev(cumsum(rev(bsp)))[-1L]
+}
+
+## Evaluate the corresponding M-spline density basis.
+get_M_basis <- function(t, knot) {
+  ord <- 3L
+  bsp <- as.numeric(splines::splineDesign(knots = knot, x = t, ord = ord))
+  3 * bsp / (knot[(1L + ord):(k.i + ord)] - knot[1L:k.i])
+}
+
+## The crucial UPDATED theorem requirement is to evaluate the PRIMARY
+## survival at tau_analysis, NOT at infinity.  The old code hardcoded
+## q1 = rep(1, k.i), incorrectly discarding the tau restriction.
+joint.surv1 <- function(t2, knot11, knot12, alpha.joint.1,
+                        alpha.mar.1.1, alpha.mar.1.2) {
+  q1 <- get_I_basis(tau_analysis, knot11)
+  q2 <- get_I_basis(t2, knot12)
+  A <- matrix(as.numeric(alpha.joint.1), k.i, k.i)  # row: T2, col: T1
+  F1 <- sum((colSums(A) + alpha.mar.1.1) * q1)
+  F2 <- sum((rowSums(A) + alpha.mar.1.2) * q2)
+  F12 <- sum(A * outer(q2, q1))
+  1 - F1 - F2 + F12  # S_1(tau_analysis, t2)
+}
+
+## -partial_2 S_0(tau_analysis,t2) = f_{2,0}(t2)
+##                                 - partial_2 F_{12,0}(tau_analysis,t2).
+## The old q1=1 expression evaluated a different, incorrect functional.
+joint.dcdf0 <- function(t2, knot01, knot02, alpha.joint.0,
+                        alpha.mar.0.2) {
+  q1 <- get_I_basis(tau_analysis, knot01)
+  m2 <- get_M_basis(t2, knot02)
+  A <- matrix(as.numeric(alpha.joint.0), k.i, k.i)
+  f2 <- sum((rowSums(A) + alpha.mar.0.2) * m2)
+  dF12 <- sum(A * outer(m2, q1))
+  dF12 - f2  # partial_2 S_0(tau_analysis, t2), nonpositive
+}
+
+joint.multip <- function(t, knot01, knot02, knot11, knot12,
+                        alpha.joint.0, alpha.mar.0.2,
+                        alpha.joint.1, alpha.mar.1.1, alpha.mar.1.2) {
+  -joint.surv1(t, knot11, knot12, alpha.joint.1,
+               alpha.mar.1.1, alpha.mar.1.2) *
+    joint.dcdf0(t, knot01, knot02, alpha.joint.0, alpha.mar.0.2)
+}
+
+est.win.ratio2 <- function(knot01, knot02, knot11, knot12,
+                           alpha.joint.0, alpha.mar.0.2,
+                           alpha.joint.1, alpha.mar.1.1, alpha.mar.1.2,
+                           tau_l = tau_lower) {
+  ## Trimmed secondary comparison [tau_l, tau].
+  start <- tau_l
+  end <- min(max(knot02), max(knot12), tau_analysis)
+  if (end <= start) stop("Invalid secondary integral boundaries")
+  parts <- 1000L
+  dif <- (end - start) / parts
+  integrate.vec <- vapply(seq_len(parts), function(ind) {
+    joint.multip(start + ind*dif, knot01, knot02, knot11, knot12,
+                 alpha.joint.0, alpha.mar.0.2,
+                 alpha.joint.1, alpha.mar.1.1, alpha.mar.1.2) * dif
+  }, numeric(1))
+  sum(integrate.vec)
+}
+
+############### helper: compute Win, Lose, and logWR ###############
+est_win_prob <- function(spl0, spl1, tau_l = tau_lower) {
+  knot01 <- spl0$knot1; knot02 <- spl0$knot2
+  knot11 <- spl1$knot1; knot12 <- spl1$knot2
+
+  alpha.joint.0 <- spl0$alpha[1:(k.i*k.i)]
+  alpha.joint.1 <- spl1$alpha[1:(k.i*k.i)]
+
+  alpha.mar.0.2 <- spl0$alpha[(k.i*k.i + 1):(k.i*k.i + k.i)]
+  alpha.mar.0.1 <- spl0$alpha[(k.i*k.i + k.i + 1):(k.i*k.i + 2*k.i)]
+
+  alpha.mar.1.2 <- spl1$alpha[(k.i*k.i + 1):(k.i*k.i + k.i)]
+  alpha.mar.1.1 <- spl1$alpha[(k.i*k.i + k.i + 1):(k.i*k.i + 2*k.i)]
+
+  est.win.ratio1(knot01, knot11, alpha.joint.0, alpha.mar.0.1, alpha.joint.1, alpha.mar.1.1, tau_l = tau_l) +
+    est.win.ratio2(knot01, knot02, knot11, knot12, alpha.joint.0, alpha.mar.0.2, alpha.joint.1, alpha.mar.1.1, alpha.mar.1.2, tau_l = tau_l)
+}
+
+est_log_wr <- function(spl0, spl1, eps = 1e-12, tau_l = tau_lower) {
+  win  <- est_win_prob(spl0, spl1, tau_l = tau_l)
+  lose <- est_win_prob(spl1, spl0, tau_l = tau_l)
+  if (!is.finite(win) || !is.finite(lose) || win <= eps || lose <= eps) return(NA_real_)
+  log(win/lose)
+}
+
+## TRUE log win ratio under Gaussian copula + lognormal margins
+true_log_wr_gaussian_lognorm_mc <- function(
+    rho,
+    m10, s10, m20, s20,
+    m11, s11, m21, s21,
+    tau = 5.0, tau_l = tau_lower,
+    Nmc = 5000000L,
+    seed = 12345) {
+  stopifnot(tau_l > 0, tau_l < tau)
+  set.seed(seed)
+  gc <- copula::normalCopula(param = rho, dim = 2, dispstr = "un")
+
+  u0 <- copula::rCopula(Nmc, gc)
+  T0 <- qlnorm(u0[,1], meanlog = m10, sdlog = s10)
+  S0 <- qlnorm(u0[,2], meanlog = m20, sdlog = s20)
+
+  u1 <- copula::rCopula(Nmc, gc)
+  T1 <- qlnorm(u1[,1], meanlog = m11, sdlog = s11)
+  S1 <- qlnorm(u1[,2], meanlog = m21, sdlog = s21)
+
+  ## Primary win: control event occurs first inside the restricted window.
+  win_primary  <- (T1 > T0) & (T0 >= tau_l) & (T0 <= tau)
+  loss_primary <- (T0 > T1) & (T1 >= tau_l) & (T1 <= tau)
+
+  ## Secondary comparison only if both primary times exceed tau.
+  ## Secondary winning event must also lie in the restricted window.
+  tie_primary <- (T0 > tau) & (T1 > tau)
+  win_sec  <- tie_primary & (S1 > S0) & (S0 >= tau_l) & (S0 <= tau)
+  loss_sec <- tie_primary & (S0 > S1) & (S1 >= tau_l) & (S1 <= tau)
+
+  W <- mean(win_primary | win_sec)
+  L <- mean(loss_primary | loss_sec)
+
+  ## Paired untrimmed comparison: same generated latent draws, no extra RNG.
+  win_primary_u  <- (T1 > T0) & (T0 <= tau)
+  loss_primary_u <- (T0 > T1) & (T1 <= tau)
+  win_sec_u  <- tie_primary & (S1 > S0) & (S0 <= tau)
+  loss_sec_u <- tie_primary & (S0 > S1) & (S1 <= tau)
+  W_u <- mean(win_primary_u | win_sec_u)
+  L_u <- mean(loss_primary_u | loss_sec_u)
+
+  list(W = W, L = L, log_wr = log(W / L),
+       W_untrimmed = W_u, L_untrimmed = L_u,
+       log_wr_untrimmed = log(W_u / L_u))
+}
+
+## FINAL FIT VALIDATION / WR-DIAGNOSTIC
+
+validate_fit <- function(ans, tol = 1e-7) {
+  if (is.null(ans$status)) {
+    ans$status <- "invalid_fit_object"
+    ans$detail <- "Missing status"
+    return(ans)
+  }
+
+  if (!identical(ans$status, "success")) return(ans)
+
+  p <- sk.i + 2L*k.i
+  a <- as.numeric(ans$alpha)
+
+  if (length(a) != p || any(!is.finite(a))) {
+    ans$status <- "invalid_coefficient_vector"
+    ans$detail <- "Coefficient vector has wrong length or non-finite entries"
+    return(ans)
+  }
+
+  if (any(a < -tol)) {
+    ans$status <- "nonnegativity_constraint_failure"
+    ans$detail <- paste0("minimum alpha=", min(a))
+    return(ans)
+  }
+
+  if (sum(a) > 1 + tol) {
+    ans$status <- "mass_constraint_failure"
+    ans$detail <- paste0("sum(alpha)=", sum(a))
+    return(ans)
+  }
+
+  if (any(!is.finite(ans$knot1)) || any(!is.finite(ans$knot2))) {
+    ans$status <- "invalid_knot_vector"
+    ans$detail <- "Non-finite knot value"
+    return(ans)
+  }
+
+  ans
+}
+
+safe_fit <- function(dat, w = rep(1, size),
+                     alpha_init = NULL,
+                     max_halvings = 10L) {
+
+  warning_messages <- character(0)
+
+  ans <- tryCatch(
+    withCallingHandlers(
+      totest_diag(
+        dat$tu_1, dat$tu_2, dat$tv_1, dat$tv_2,
+        dat$delta1_1, dat$delta2_1, dat$delta3_1,
+        dat$delta1_2, dat$delta2_2, dat$delta3_2,
+        w = w,
+        alpha_init = alpha_init,
+        max_halvings = max_halvings
+      ),
+      warning = function(wrn) {
+        warning_messages <<- c(warning_messages, conditionMessage(wrn))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = function(e) {
+      list(
+        alpha = -9999,
+        knot1 = -9999,
+        knot2 = -9999,
+        status = "R_error",
+        detail = conditionMessage(e)
+      )
+    }
+  )
+
+  ans <- validate_fit(ans)
+
+  ans$n_warnings <- length(warning_messages)
+  ans$warning_detail <- if (length(warning_messages) == 0L) {
+    NA_character_
+  } else {
+    paste(unique(warning_messages), collapse = " | ")
+  }
+
+  ans
+}
+
+## Separately evaluate the primary and secondary contributions so that
+## any downstream numerical failure is distinguishable from fit failure.
+est_win_components_diag <- function(spl0, spl1, tau_l = tau_lower) {
+
+  knot01 <- spl0$knot1
+  knot02 <- spl0$knot2
+  knot11 <- spl1$knot1
+  knot12 <- spl1$knot2
+
+  alpha.joint.0 <- spl0$alpha[1:(k.i*k.i)]
+  alpha.joint.1 <- spl1$alpha[1:(k.i*k.i)]
+
+  alpha.mar.0.2 <-
+    spl0$alpha[(k.i*k.i + 1):(k.i*k.i + k.i)]
+  alpha.mar.0.1 <-
+    spl0$alpha[(k.i*k.i + k.i + 1):(k.i*k.i + 2*k.i)]
+
+  alpha.mar.1.2 <-
+    spl1$alpha[(k.i*k.i + 1):(k.i*k.i + k.i)]
+  alpha.mar.1.1 <-
+    spl1$alpha[(k.i*k.i + k.i + 1):(k.i*k.i + 2*k.i)]
+
+  primary <- tryCatch(
+    est.win.ratio1(
+      knot01, knot11,
+      alpha.joint.0, alpha.mar.0.1,
+      alpha.joint.1, alpha.mar.1.1,
+      tau_l = tau_l
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(primary, "error")) {
+    return(list(
+      status = "primary_functional_error",
+      detail = conditionMessage(primary),
+      primary = NA_real_,
+      secondary = NA_real_,
+      total = NA_real_
+    ))
+  }
+
+  if (length(primary) != 1L || !is.finite(primary)) {
+    return(list(
+      status = "primary_functional_nonfinite",
+      detail = NA_character_,
+      primary = as.numeric(primary)[1],
+      secondary = NA_real_,
+      total = NA_real_
+    ))
+  }
+
+  secondary <- tryCatch(
+    est.win.ratio2(
+      knot01, knot02, knot11, knot12,
+      alpha.joint.0, alpha.mar.0.2,
+      alpha.joint.1, alpha.mar.1.1, alpha.mar.1.2,
+      tau_l = tau_l
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(secondary, "error")) {
+    return(list(
+      status = "secondary_functional_error",
+      detail = conditionMessage(secondary),
+      primary = primary,
+      secondary = NA_real_,
+      total = NA_real_
+    ))
+  }
+
+  if (length(secondary) != 1L || !is.finite(secondary)) {
+    return(list(
+      status = "secondary_functional_nonfinite",
+      detail = NA_character_,
+      primary = primary,
+      secondary = as.numeric(secondary)[1],
+      total = NA_real_
+    ))
+  }
+
+  total <- primary + secondary
+
+  if (!is.finite(total)) {
+    return(list(
+      status = "total_winprob_nonfinite",
+      detail = NA_character_,
+      primary = primary,
+      secondary = secondary,
+      total = total
+    ))
+  }
+
+  list(
+    status = "success",
+    detail = NA_character_,
+    primary = primary,
+    secondary = secondary,
+    total = total
+  )
+}
+
+est_log_wr_diag <- function(spl0, spl1, eps = 1e-12,
+                            tau_l = tau_lower) {
+
+  win <- est_win_components_diag(spl0, spl1, tau_l = tau_l)
+
+  if (win$status != "success") {
+    return(list(
+      status = paste0("win_", win$status),
+      detail = win$detail,
+      logwr = NA_real_,
+      win = NA_real_,
+      lose = NA_real_
+    ))
+  }
+
+  lose <- est_win_components_diag(spl1, spl0, tau_l = tau_l)
+
+  if (lose$status != "success") {
+    return(list(
+      status = paste0("loss_", lose$status),
+      detail = lose$detail,
+      logwr = NA_real_,
+      win = win$total,
+      lose = NA_real_
+    ))
+  }
+
+  if (!is.finite(win$total) || win$total <= eps) {
+    return(list(
+      status = "nonpositive_or_nonfinite_win",
+      detail = NA_character_,
+      logwr = NA_real_,
+      win = win$total,
+      lose = lose$total
+    ))
+  }
+
+  if (!is.finite(lose$total) || lose$total <= eps) {
+    return(list(
+      status = "nonpositive_or_nonfinite_loss",
+      detail = NA_character_,
+      logwr = NA_real_,
+      win = win$total,
+      lose = lose$total
+    ))
+  }
+
+  lw <- log(win$total / lose$total)
+
+  if (!is.finite(lw)) {
+    return(list(
+      status = "nonfinite_logWR",
+      detail = NA_character_,
+      logwr = lw,
+      win = win$total,
+      lose = lose$total
+    ))
+  }
+
+  list(
+    status = "success",
+    detail = NA_character_,
+    logwr = lw,
+    win = win$total,
+    lose = lose$total
+  )
+}
+
+## WARM START + SAME-MULTIPLIER RESCUE
+
+make_interior_start <- function(alpha_hat, mix = 1e-4) {
+
+  p <- sk.i + 2L*k.i
+  generic <- matrix(0.5/p, p, 1)
+
+  avec <- as.numeric(alpha_hat)
+
+  if (length(avec) != p || any(!is.finite(avec))) {
+    stop("Invalid original alpha_hat")
+  }
+
+  ah <- matrix(avec, p, 1)
+  ah[ah < 0] <- 0
+
+  if (sum(ah) >= 1) {
+    ah <- ah / sum(ah) * (1 - 1e-10)
+  }
+
+  (1 - mix) * ah + mix * generic
+}
+
+fit_bootstrap_with_rescue <- function(dat, w, alpha_hat) {
+
+  ## First attempt: start very close to the unweighted MLE.
+  start1 <- make_interior_start(alpha_hat, mix = 1e-4)
+
+  fit1 <- safe_fit(
+    dat,
+    w = w,
+    alpha_init = start1,
+    max_halvings = 30L
+  )
+
+  if (identical(fit1$status, "success")) {
+    return(list(
+      fit = fit1,
+      initial_status = fit1$status,
+      initial_detail = fit1$detail,
+      rescue_used = FALSE,
+      rescue_status = NA_character_,
+      rescue_detail = NA_character_
+    ))
+  }
+
+  ## Rescue attempt: SAME weights, more interior start, longer line search.
+  start2 <- make_interior_start(alpha_hat, mix = 0.05)
+
+  fit2 <- safe_fit(
+    dat,
+    w = w,
+    alpha_init = start2,
+    max_halvings = 60L
+  )
+
+  list(
+    fit = fit2,
+    initial_status = fit1$status,
+    initial_detail = fit1$detail,
+    rescue_used = TRUE,
+    rescue_status = fit2$status,
+    rescue_detail = fit2$detail
+  )
+}
+
+## ONE FIXED MULTIPLIER REALIZATION
+
+one_bootstrap <- function(b, W0, W1, data0, data1, fit0, fit1) {
+
+  ## The weights were generated BEFORE fitting.  Rescue never redraws them.
+  w0 <- W0[b, ]
+  w1 <- W1[b, ]
+
+  res0 <- fit_bootstrap_with_rescue(data0, w0, fit0$alpha)
+  res1 <- fit_bootstrap_with_rescue(data1, w1, fit1$alpha)
+
+  f0 <- res0$fit
+  f1 <- res1$fit
+
+  both_fit_success <-
+    identical(f0$status, "success") &&
+    identical(f1$status, "success")
+
+  if (both_fit_success) {
+    fun <- est_log_wr_diag(f0, f1)
+    fun_untrimmed <- est_log_wr_diag(f0, f1, tau_l = tau_lower_untrimmed)
+  } else {
+    fun <- list(
+      status = "not_evaluated_fit_failure",
+      detail = NA_character_,
+      logwr = NA_real_,
+      win = NA_real_,
+      lose = NA_real_
+    )
+    fun_untrimmed <- fun
+  }
+
+  final_status_untrimmed <- if (both_fit_success &&
+                                  identical(fun_untrimmed$status, "success") &&
+                                  is.finite(fun_untrimmed$logwr)) {
+    "success"
+  } else if (!both_fit_success) {
+    "fit_failure"
+  } else {
+    "functional_failure"
+  }
+
+  final_status <- if (both_fit_success &&
+                      identical(fun$status, "success") &&
+                      is.finite(fun$logwr)) {
+    "success"
+  } else if (!both_fit_success) {
+    "fit_failure"
+  } else {
+    "functional_failure"
+  }
+
+  data.frame(
+    bootstrap_rep = b,
+
+    fit0_initial_status = res0$initial_status,
+    fit0_initial_detail = res0$initial_detail,
+    fit0_rescue_used = res0$rescue_used,
+    fit0_rescue_status = res0$rescue_status,
+    fit0_rescue_detail = res0$rescue_detail,
+    fit0_final_status = f0$status,
+    fit0_final_detail = f0$detail,
+
+    fit1_initial_status = res1$initial_status,
+    fit1_initial_detail = res1$initial_detail,
+    fit1_rescue_used = res1$rescue_used,
+    fit1_rescue_status = res1$rescue_status,
+    fit1_rescue_detail = res1$rescue_detail,
+    fit1_final_status = f1$status,
+    fit1_final_detail = f1$detail,
+
+    functional_status = fun$status,
+    functional_detail = fun$detail,
+    logwr = fun$logwr,
+    final_status = final_status,
+
+    ## Additive paired target; pre-existing diagnostic columns unchanged.
+    functional_status_untrimmed = fun_untrimmed$status,
+    functional_detail_untrimmed = fun_untrimmed$detail,
+    logwr_untrimmed = fun_untrimmed$logwr,
+    final_status_untrimmed = final_status_untrimmed,
+
+    stringsAsFactors = FALSE
+  )
+}
+
+# Multiplier bootstrap
+
+summarize_bootstrap_dataset <- function(boot_df, logwr_hat, true_log_wr) {
+
+  initial_both_success <-
+    boot_df$fit0_initial_status == "success" &
+    boot_df$fit1_initial_status == "success"
+
+  final_fit_both_success <-
+    boot_df$fit0_final_status == "success" &
+    boot_df$fit1_final_status == "success"
+
+  final_success <-
+    boot_df$final_status == "success" &
+    is.finite(boot_df$logwr)
+
+  rescued_success <-
+    final_success & !initial_both_success
+
+  z_initial <-
+    boot_df$logwr[final_success & initial_both_success]
+
+  z_final <-
+    boot_df$logwr[final_success]
+
+  n_initial_any_fit_fail <-
+    sum(!initial_both_success)
+
+  n_final_any_fit_fail <-
+    sum(!final_fit_both_success)
+
+  n_functional_fail <-
+    sum(final_fit_both_success &
+        boot_df$functional_status != "success")
+
+  n_final_success <- sum(final_success)
+  n_residual_unusable <- nrow(boot_df) - n_final_success
+
+  se_initial <-
+    if (length(z_initial) >= 2L) sd(z_initial) else NA_real_
+
+  se_final <-
+    if (length(z_final) >= 2L) sd(z_final) else NA_real_
+
+  mean_initial <-
+    if (length(z_initial) >= 1L) mean(z_initial) else NA_real_
+
+  mean_final <-
+    if (length(z_final) >= 1L) mean(z_final) else NA_real_
+
+  abs_se_change_rescue_pct <-
+    if (is.finite(se_initial) &&
+        is.finite(se_final) &&
+        se_final > 0) {
+      100 * abs(se_final - se_initial) / se_final
+    } else {
+      NA_real_
+    }
+
+  abs_mean_shift_in_SE <-
+    if (is.finite(mean_initial) &&
+        is.finite(mean_final) &&
+        is.finite(se_final) &&
+        se_final > 0) {
+      abs(mean_final - mean_initial) / se_final
+    } else {
+      NA_real_
+    }
+
+  ## Log-scale Wald CI based on all successful fixed multiplier draws.
+  zcrit <- qnorm(0.975)
+
+  cover95 <-
+    if (is.finite(se_final)) {
+      as.integer(
+        logwr_hat - zcrit * se_final <= true_log_wr &&
+        logwr_hat + zcrit * se_final >= true_log_wr
+      )
+    } else {
+      NA_integer_
+    }
+
+  ## Conservative tail stress tests for the remaining unresolved draws.
+  ## These are sensitivity scenarios, not imputations claimed to be correct.
+  se_tail_low <- se_final
+  se_tail_high <- se_final
+  se_tail_split <- se_final
+
+  cover_tail_low <- cover95
+  cover_tail_high <- cover95
+  cover_tail_split <- cover95
+
+  tail_low_change_pct <- 0
+  tail_high_change_pct <- 0
+  tail_split_change_pct <- 0
+
+  if (length(z_final) >= 2L && n_residual_unusable > 0L) {
+
+    qs <- as.numeric(
+      quantile(
+        z_final,
+        probs = c(0.01, 0.99),
+        names = FALSE,
+        type = 7
+      )
+    )
+
+    q01 <- qs[1]
+    q99 <- qs[2]
+
+    se_tail_low <-
+      sd(c(z_final, rep(q01, n_residual_unusable)))
+
+    se_tail_high <-
+      sd(c(z_final, rep(q99, n_residual_unusable)))
+
+    n_low <- floor(n_residual_unusable / 2)
+    n_high <- n_residual_unusable - n_low
+
+    se_tail_split <-
+      sd(c(
+        z_final,
+        rep(q01, n_low),
+        rep(q99, n_high)
+      ))
+
+    tail_low_change_pct <-
+      100 * (se_tail_low - se_final) / se_final
+
+    tail_high_change_pct <-
+      100 * (se_tail_high - se_final) / se_final
+
+    tail_split_change_pct <-
+      100 * (se_tail_split - se_final) / se_final
+
+    cover_tail_low <- as.integer(
+      logwr_hat - zcrit * se_tail_low <= true_log_wr &&
+      logwr_hat + zcrit * se_tail_low >= true_log_wr
+    )
+
+    cover_tail_high <- as.integer(
+      logwr_hat - zcrit * se_tail_high <= true_log_wr &&
+      logwr_hat + zcrit * se_tail_high >= true_log_wr
+    )
+
+    cover_tail_split <- as.integer(
+      logwr_hat - zcrit * se_tail_split <= true_log_wr &&
+      logwr_hat + zcrit * se_tail_split >= true_log_wr
+    )
+  }
+
+  data.frame(
+    n_boot_attempted = nrow(boot_df),
+
+    n_initial_any_fit_fail = n_initial_any_fit_fail,
+    initial_any_fit_failure_pct =
+      100 * n_initial_any_fit_fail / nrow(boot_df),
+
+    n_fit0_initial_fail =
+      sum(boot_df$fit0_initial_status != "success"),
+
+    n_fit1_initial_fail =
+      sum(boot_df$fit1_initial_status != "success"),
+
+    n_fit0_rescued =
+      sum(boot_df$fit0_initial_status != "success" &
+          boot_df$fit0_final_status == "success"),
+
+    n_fit1_rescued =
+      sum(boot_df$fit1_initial_status != "success" &
+          boot_df$fit1_final_status == "success"),
+
+    n_rescued_successful_draws = sum(rescued_success),
+
+    n_final_any_fit_fail = n_final_any_fit_fail,
+    final_any_fit_failure_pct =
+      100 * n_final_any_fit_fail / nrow(boot_df),
+
+    n_functional_fail = n_functional_fail,
+
+    n_final_success = n_final_success,
+    n_residual_unusable = n_residual_unusable,
+    residual_unusable_pct =
+      100 * n_residual_unusable / nrow(boot_df),
+
+    se_initial_success_only = se_initial,
+    se_after_rescue = se_final,
+    abs_se_change_rescue_pct = abs_se_change_rescue_pct,
+
+    mean_initial_success_only = mean_initial,
+    mean_after_rescue = mean_final,
+    abs_mean_shift_in_SE = abs_mean_shift_in_SE,
+
+    cover95 = cover95,
+
+    se_tail_low = se_tail_low,
+    se_tail_high = se_tail_high,
+    se_tail_split = se_tail_split,
+
+    tail_low_change_pct = tail_low_change_pct,
+    tail_high_change_pct = tail_high_change_pct,
+    tail_split_change_pct = tail_split_change_pct,
+
+    cover_tail_low = cover_tail_low,
+    cover_tail_high = cover_tail_high,
+    cover_tail_split = cover_tail_split,
+
+    stringsAsFactors = FALSE
+  )
+}
+
+## Same columns as summarize_bootstrap_dataset(), used when the
+## original point estimate is unavailable and bootstrap is therefore not run.
+empty_bootstrap_summary <- function() {
+  data.frame(
+    n_boot_attempted = NA_integer_,
+    n_initial_any_fit_fail = NA_integer_,
+    initial_any_fit_failure_pct = NA_real_,
+    n_fit0_initial_fail = NA_integer_,
+    n_fit1_initial_fail = NA_integer_,
+    n_fit0_rescued = NA_integer_,
+    n_fit1_rescued = NA_integer_,
+    n_rescued_successful_draws = NA_integer_,
+    n_final_any_fit_fail = NA_integer_,
+    final_any_fit_failure_pct = NA_real_,
+    n_functional_fail = NA_integer_,
+    n_final_success = NA_integer_,
+    n_residual_unusable = NA_integer_,
+    residual_unusable_pct = NA_real_,
+    se_initial_success_only = NA_real_,
+    se_after_rescue = NA_real_,
+    abs_se_change_rescue_pct = NA_real_,
+    mean_initial_success_only = NA_real_,
+    mean_after_rescue = NA_real_,
+    abs_mean_shift_in_SE = NA_real_,
+    cover95 = NA_integer_,
+    se_tail_low = NA_real_,
+    se_tail_high = NA_real_,
+    se_tail_split = NA_real_,
+    tail_low_change_pct = NA_real_,
+    tail_high_change_pct = NA_real_,
+    tail_split_change_pct = NA_real_,
+    cover_tail_low = NA_integer_,
+    cover_tail_high = NA_integer_,
+    cover_tail_split = NA_integer_,
+    stringsAsFactors = FALSE
+  )
+}
+
+## Replay the exact same diagnostic definitions on the paired exploratory target.
+## This does NOT refit, resample, or replace any multiplier draw.
+summarize_bootstrap_dataset_untrimmed <- function(boot_df, logwr_hat, truth) {
+  paired_df <- boot_df
+  paired_df$logwr <- paired_df$logwr_untrimmed
+  paired_df$final_status <- paired_df$final_status_untrimmed
+  paired_df$functional_status <- paired_df$functional_status_untrimmed
+  result <- summarize_bootstrap_dataset(paired_df, logwr_hat, truth)
+  names(result) <- paste0(names(result), "_untrimmed")
+  result
+}
+
+empty_bootstrap_summary_untrimmed <- function() {
+  result <- empty_bootstrap_summary()
+  names(result) <- paste0(names(result), "_untrimmed")
+  result
+}
+
+## FAILURE-REASON TABLE
+
+make_failure_reason_table <- function(mc_results, boot_results) {
+
+  out <- list()
+  j <- 0L
+
+  add_counts <- function(x, stage, arm, denominator) {
+    x <- x[!is.na(x) & x != "success"]
+    if (length(x) == 0L) return(NULL)
+
+    tt <- sort(table(x), decreasing = TRUE)
+
+    data.frame(
+      stage = stage,
+      arm = arm,
+      reason = names(tt),
+      count = as.integer(tt),
+      denominator = denominator,
+      percent = 100 * as.integer(tt) / denominator,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  tmp <- add_counts(
+    mc_results$fit0_status,
+    "original_fit",
+    "control",
+    nrow(mc_results)
+  )
+  if (!is.null(tmp)) {
+    j <- j + 1L
+    out[[j]] <- tmp
+  }
+
+  tmp <- add_counts(
+    mc_results$fit1_status,
+    "original_fit",
+    "treatment",
+    nrow(mc_results)
+  )
+  if (!is.null(tmp)) {
+    j <- j + 1L
+    out[[j]] <- tmp
+  }
+
+  idx_orig_fun <-
+    mc_results$fit0_status == "success" &
+    mc_results$fit1_status == "success"
+
+  if (any(idx_orig_fun)) {
+    tmp <- add_counts(
+      mc_results$original_functional_status[idx_orig_fun],
+      "original_functional",
+      "both_arms_fit",
+      sum(idx_orig_fun)
+    )
+    if (!is.null(tmp)) {
+      j <- j + 1L
+      out[[j]] <- tmp
+    }
+  }
+
+  if (nrow(boot_results) > 0L) {
+
+    tmp <- add_counts(
+      boot_results$fit0_initial_status,
+      "bootstrap_initial",
+      "control",
+      nrow(boot_results)
+    )
+    if (!is.null(tmp)) {
+      j <- j + 1L
+      out[[j]] <- tmp
+    }
+
+    tmp <- add_counts(
+      boot_results$fit1_initial_status,
+      "bootstrap_initial",
+      "treatment",
+      nrow(boot_results)
+    )
+    if (!is.null(tmp)) {
+      j <- j + 1L
+      out[[j]] <- tmp
+    }
+
+    tmp <- add_counts(
+      boot_results$fit0_final_status,
+      "bootstrap_after_rescue",
+      "control",
+      nrow(boot_results)
+    )
+    if (!is.null(tmp)) {
+      j <- j + 1L
+      out[[j]] <- tmp
+    }
+
+    tmp <- add_counts(
+      boot_results$fit1_final_status,
+      "bootstrap_after_rescue",
+      "treatment",
+      nrow(boot_results)
+    )
+    if (!is.null(tmp)) {
+      j <- j + 1L
+      out[[j]] <- tmp
+    }
+
+    idx_fun <-
+      boot_results$fit0_final_status == "success" &
+      boot_results$fit1_final_status == "success"
+
+    if (any(idx_fun)) {
+      tmp <- add_counts(
+        boot_results$functional_status[idx_fun],
+        "bootstrap_functional",
+        "both_arms_fit",
+        sum(idx_fun)
+      )
+      if (!is.null(tmp)) {
+        j <- j + 1L
+        out[[j]] <- tmp
+      }
+    }
+  }
+
+  if (length(out) == 0L) {
+    data.frame(
+      stage = character(0),
+      arm = character(0),
+      reason = character(0),
+      count = integer(0),
+      denominator = integer(0),
+      percent = numeric(0)
+    )
+  } else {
+    do.call(rbind, out)
+  }
+}
+
+## TRUE VALUE
+
+cat("\nComputing Monte Carlo truth...\n")
+
+truth <- true_log_wr_gaussian_lognorm_mc(
+  rho = rho,
+  m10 = m10, s10 = s10,
+  m20 = m20, s20 = s20,
+  m11 = m11, s11 = s11,
+  m21 = m21, s21 = s21,
+  tau = tau_analysis,
+  tau_l = tau_lower,
+  Nmc = NMC_TRUTH,
+  seed = truth_seed
+)
+
+true_log_wr <- truth$log_wr
+true_wr <- exp(true_log_wr)
+true_log_wr_untrimmed <- truth$log_wr_untrimmed
+true_wr_untrimmed <- exp(true_log_wr_untrimmed)
+
+cat("Trimmed true log-WR   =", true_log_wr, "\n")
+cat("Trimmed true WR       =", true_wr, "\n")
+cat("Untrimmed true log-WR =", true_log_wr_untrimmed, "\n")
+cat("Untrimmed true WR     =", true_wr_untrimmed, "\n")
+
+## OPTIONAL PARALLEL BACKEND
+
+cl <- NULL
+
+if (USE_PARALLEL) {
+  cl <- parallel::makeCluster(N_CORES)
+  doParallel::registerDoParallel(cl)
+  cat("Parallel bootstrap fitting with", N_CORES, "cores.\n")
+} else {
+  foreach::registerDoSEQ()
+  cat("Sequential bootstrap fitting.\n")
+}
+
+# Monte Carlo truth
+
+set.seed(simulation_seed)
+
+mc_list <- vector("list", M)
+boot_list_all <- vector("list", M)
+
+ptm <- proc.time()
+
+for (m in seq_len(M)) {
+
+  cat(
+    "\n============================================================\n",
+    "Dataset ", m, " of ", M, "\n",
+    "============================================================\n",
+    sep = ""
+  )
+  flush.console()
+
+  ## Generate one fixed dataset
+  time0 <- get_time(rho, m10, s10, m20, s20)
+  time1 <- get_time(rho, m11, s11, m21, s21)
+
+  data0 <- from.event.to.censor(
+    size,
+    time0$x1,
+    time0$x2
+  )
+
+  data1 <- from.event.to.censor(
+    size,
+    time1$x1,
+    time1$x2
+  )
+
+  ## Original unweighted fits
+  fit0 <- safe_fit(
+    data0,
+    w = rep(1, size),
+    alpha_init = NULL,
+    max_halvings = 10L
+  )
+
+  fit1 <- safe_fit(
+    data1,
+    w = rep(1, size),
+    alpha_init = NULL,
+    max_halvings = 10L
+  )
+
+  both_original_fit_success <-
+    identical(fit0$status, "success") &&
+    identical(fit1$status, "success")
+
+  if (both_original_fit_success) {
+    original_fun <- est_log_wr_diag(fit0, fit1)
+    original_fun_untrimmed <-
+      est_log_wr_diag(fit0, fit1, tau_l = tau_lower_untrimmed)
+  } else {
+    original_fun <- list(
+      status = "not_evaluated_fit_failure",
+      detail = NA_character_,
+      logwr = NA_real_
+    )
+    original_fun_untrimmed <- original_fun
+  }
+
+  point_success_untrimmed <-
+    both_original_fit_success &&
+    identical(original_fun_untrimmed$status, "success") &&
+    is.finite(original_fun_untrimmed$logwr)
+
+  point_success <-
+    both_original_fit_success &&
+    identical(original_fun$status, "success") &&
+    is.finite(original_fun$logwr)
+
+  ## Base MC record.  Bootstrap fields are filled below if point_success.
+  rec <- data.frame(
+    dataset = m,
+
+    fit0_status = fit0$status,
+    fit0_detail = fit0$detail,
+    fit0_n_warnings = fit0$n_warnings,
+    fit0_warning_detail = fit0$warning_detail,
+
+    fit1_status = fit1$status,
+    fit1_detail = fit1$detail,
+    fit1_n_warnings = fit1$n_warnings,
+    fit1_warning_detail = fit1$warning_detail,
+
+    original_functional_status = original_fun$status,
+    original_functional_detail = original_fun$detail,
+
+    point_status =
+      if (point_success) "success"
+      else if (!both_original_fit_success) "fit_failure"
+      else "functional_failure",
+
+    logwr_hat =
+      if (point_success) original_fun$logwr else NA_real_,
+
+    wr_hat =
+      if (point_success) exp(original_fun$logwr) else NA_real_,
+
+    original_functional_status_untrimmed = original_fun_untrimmed$status,
+    original_functional_detail_untrimmed = original_fun_untrimmed$detail,
+    point_status_untrimmed =
+      if (point_success_untrimmed) "success"
+      else if (!both_original_fit_success) "fit_failure"
+      else "functional_failure",
+    logwr_hat_untrimmed =
+      if (point_success_untrimmed) original_fun_untrimmed$logwr else NA_real_,
+    wr_hat_untrimmed =
+      if (point_success_untrimmed) exp(original_fun_untrimmed$logwr) else NA_real_,
+
+    stringsAsFactors = FALSE
+  )
+
+  if (!point_success) {
+
+    cat(
+      "Original point estimate unavailable:",
+      rec$point_status,
+      "| control =", fit0$status,
+      "| treatment =", fit1$status,
+      "| functional =", original_fun$status,
+      "\n"
+    )
+
+    rec <- cbind(rec, empty_bootstrap_summary(),
+                 empty_bootstrap_summary_untrimmed())
+
+    mc_list[[m]] <- rec
+    boot_list_all[[m]] <- NULL
+
+    ## Fixed-M design: move to the next dataset; do NOT replace this dataset.
+    next
+  }
+
+  cat(
+    "Original point estimate successful; log-WR =",
+    round(original_fun$logwr, 6),
+    "\n"
+  )
+
+  ## Generate EXACTLY B multiplier realizations before fitting.
+  ## Control and treatment weights are independent.
+  W0 <- matrix(
+    rexp(B * size, rate = 1),
+    nrow = B,
+    ncol = size
+  )
+
+  W1 <- matrix(
+    rexp(B * size, rate = 1),
+    nrow = B,
+    ncol = size
+  )
+
+  ## Normalization does not change a weighted-likelihood maximizer because
+  ## it multiplies all weights in an arm by the same positive constant.
+  W0 <- W0 / rowMeans(W0)
+  W1 <- W1 / rowMeans(W1)
+
+  ## Weighted bootstrap
+  if (USE_PARALLEL) {
+
+    boot_rows <- foreach(
+      b = seq_len(B),
+      .combine = rbind,
+      .packages = c("splines"),
+      .export = c(
+        "one_bootstrap",
+        "fit_bootstrap_with_rescue",
+        "make_interior_start",
+        "safe_fit",
+        "validate_fit",
+        "totest_diag",
+        "get_knots",
+        "sumvectorfunction",
+        "sumfunction",
+        "gg_pre",
+        "hh_pre",
+        "est_log_wr_diag",
+        "est_win_components_diag",
+        "est.win.ratio1",
+        "est.win.ratio2",
+        "mar.surv1",
+        "mar.dcdf0",
+        "mar.multip",
+        "joint.surv1",
+        "joint.dcdf0",
+        "joint.multip",
+        "get_I_basis",
+        "get_M_basis",
+        "k.i",
+        "sk.i",
+        "size",
+        "tau_analysis",
+        "tau_lower",
+        "tau_lower_untrimmed"
+      )
+    ) %dopar% {
+      one_bootstrap(
+        b = b,
+        W0 = W0,
+        W1 = W1,
+        data0 = data0,
+        data1 = data1,
+        fit0 = fit0,
+        fit1 = fit1
+      )
+    }
+
+  } else {
+
+    boot_rows <- do.call(
+      rbind,
+      lapply(
+        seq_len(B),
+        function(b) {
+          one_bootstrap(
+            b = b,
+            W0 = W0,
+            W1 = W1,
+            data0 = data0,
+            data1 = data1,
+            fit0 = fit0,
+            fit1 = fit1
+          )
+        }
+      )
+    )
+  }
+
+  boot_rows$dataset <- m
+  boot_rows <- boot_rows[
+    ,
+    c("dataset", setdiff(names(boot_rows), "dataset"))
+  ]
+
+  boot_list_all[[m]] <- boot_rows
+
+  ## Dataset-level bootstrap summary and sensitivity analysis.
+  bs <- summarize_bootstrap_dataset(
+    boot_rows,
+    logwr_hat = original_fun$logwr,
+    true_log_wr = true_log_wr
+  )
+  bs_untrimmed <- summarize_bootstrap_dataset_untrimmed(
+    boot_rows,
+    logwr_hat = original_fun_untrimmed$logwr,
+    truth = true_log_wr_untrimmed
+  )
+
+  rec <- cbind(rec, bs, bs_untrimmed)
+
+  mc_list[[m]] <- rec
+
+  cat(
+    "Bootstrap:",
+    bs$n_final_success, "of", B, "usable after rescue;",
+    "initial any-fit failure =", round(bs$initial_any_fit_failure_pct, 2), "%;",
+    "residual unusable =", round(bs$residual_unusable_pct, 2), "%;",
+    "SE =", round(bs$se_after_rescue, 6),
+    "\n"
+  )
+
+  ## Save a rolling checkpoint for THIS scenario.
+  ## This is not used to replace failures; it only preserves completed work.
+  mc_checkpoint <- do.call(
+    rbind,
+    mc_list[!vapply(mc_list, is.null, logical(1))]
+  )
+
+  write.csv(
+    mc_checkpoint,
+    file.path(
+      OUTPUT_DIR,
+      paste0(output_tag, "_MC_results_checkpoint.csv")
+    ),
+    row.names = FALSE
+  )
+}
+
+## STOP PARALLEL BACKEND
+
+if (!is.null(cl)) {
+  parallel::stopCluster(cl)
+}
+
+## COMBINE RESULTS
+
+mc_results <- do.call(
+  rbind,
+  mc_list[!vapply(mc_list, is.null, logical(1))]
+)
+
+nonempty_boot <-
+  boot_list_all[!vapply(boot_list_all, is.null, logical(1))]
+
+if (length(nonempty_boot) > 0L) {
+  boot_results <- do.call(rbind, nonempty_boot)
+} else {
+  boot_results <- data.frame()
+}
+
+# Summary
+
+point_ok <-
+  mc_results$point_status == "success" &
+  is.finite(mc_results$logwr_hat)
+
+infer_ok <-
+  point_ok &
+  is.finite(mc_results$se_after_rescue)
+
+n_point <- sum(point_ok)
+n_infer <- sum(infer_ok)
+
+mean_logwr <-
+  if (n_point > 0L)
+    mean(mc_results$logwr_hat[point_ok])
+  else NA_real_
+
+bias_logwr <-
+  if (is.finite(mean_logwr))
+    mean_logwr - true_log_wr
+  else NA_real_
+
+ese_logwr_all <-
+  if (n_point > 1L)
+    sd(mc_results$logwr_hat[point_ok])
+  else NA_real_
+
+ese_logwr_infer <-
+  if (n_infer > 1L)
+    sd(mc_results$logwr_hat[infer_ok])
+  else NA_real_
+
+ase_logwr <-
+  if (n_infer > 0L)
+    mean(mc_results$se_after_rescue[infer_ok])
+  else NA_real_
+
+coverage95 <-
+  if (n_infer > 0L)
+    mean(mc_results$cover95[infer_ok])
+  else NA_real_
+
+mean_wr <-
+  if (n_point > 0L)
+    mean(mc_results$wr_hat[point_ok])
+  else NA_real_
+
+bias_wr <-
+  if (is.finite(mean_wr))
+    mean_wr - true_wr
+  else NA_real_
+
+ese_wr <-
+  if (n_point > 1L)
+    sd(mc_results$wr_hat[point_ok])
+  else NA_real_
+
+## Delta-method version of the bootstrap SE on the WR scale.
+ase_wr_delta <-
+  if (n_infer > 0L)
+    mean(
+      mc_results$wr_hat[infer_ok] *
+      mc_results$se_after_rescue[infer_ok]
+    )
+  else NA_real_
+
+## PAIRED PERFORMANCE -- same datasets AND same bootstrap fits
+
+make_target_performance <- function(suffix, target_label, lower, truth_logwr) {
+  is_u <- identical(suffix, "_untrimmed")
+  point_col <- if (is_u) "point_status_untrimmed" else "point_status"
+  log_col <- if (is_u) "logwr_hat_untrimmed" else "logwr_hat"
+  wr_col <- if (is_u) "wr_hat_untrimmed" else "wr_hat"
+  se_col <- if (is_u) "se_after_rescue_untrimmed" else "se_after_rescue"
+  cover_col <- if (is_u) "cover95_untrimmed" else "cover95"
+  valid <- mc_results[[point_col]] == "success" & is.finite(mc_results[[log_col]])
+  inferred <- valid & is.finite(mc_results[[se_col]])
+  nn <- sum(valid); ni <- sum(inferred)
+  mlog <- if (nn > 0L) mean(mc_results[[log_col]][valid]) else NA_real_
+  mwr <- if (nn > 0L) mean(mc_results[[wr_col]][valid]) else NA_real_
+  data.frame(
+    target = target_label, tau_lower = lower, tau = tau_analysis,
+    true_WR = exp(truth_logwr), true_logWR = truth_logwr,
+    n_valid_point_estimates = nn, n_with_bootstrap_SE = ni,
+    WR_estimate = mwr, mean_logWR = mlog,
+    bias_logWR = mlog - truth_logwr,
+    ESE_logWR_all = if (nn > 1L) sd(mc_results[[log_col]][valid]) else NA_real_,
+    ESE_logWR_inference_subset =
+      if (ni > 1L) sd(mc_results[[log_col]][inferred]) else NA_real_,
+    ASE_logWR = if (ni > 0L) mean(mc_results[[se_col]][inferred]) else NA_real_,
+    coverage95 = if (ni > 0L) mean(mc_results[[cover_col]][inferred], na.rm = TRUE) else NA_real_,
+    stringsAsFactors = FALSE
+  )
+}
+
+performance_results <- rbind(
+  make_target_performance("", "Trimmed: both event integrals start at tau_l",
+                          tau_lower, true_log_wr),
+  make_target_performance("_untrimmed",
+                          "Untrimmed exploratory: both integrals start at 0",
+                          tau_lower_untrimmed, true_log_wr_untrimmed)
+)
+paired_ok <- mc_results$point_status == "success" &
+             mc_results$point_status_untrimmed == "success" &
+             is.finite(mc_results$logwr_hat) &
+             is.finite(mc_results$logwr_hat_untrimmed)
+paired_logwr_diff <- mc_results$logwr_hat_untrimmed[paired_ok] -
+                     mc_results$logwr_hat[paired_ok]
+mean_paired_logwr_diff <- if (length(paired_logwr_diff) > 0L)
+  mean(paired_logwr_diff) else NA_real_
+max_abs_paired_logwr_diff <- if (length(paired_logwr_diff) > 0L)
+  max(abs(paired_logwr_diff)) else NA_real_
+
+# Summary
+
+orig_fit0_fail <-
+  mc_results$fit0_status != "success"
+
+orig_fit1_fail <-
+  mc_results$fit1_status != "success"
+
+orig_any_fit_fail <-
+  orig_fit0_fail | orig_fit1_fail
+
+orig_functional_fail <-
+  mc_results$fit0_status == "success" &
+  mc_results$fit1_status == "success" &
+  mc_results$original_functional_status != "success"
+
+if (nrow(boot_results) > 0L) {
+
+  boot_initial_fit0_fail <-
+    boot_results$fit0_initial_status != "success"
+
+  boot_initial_fit1_fail <-
+    boot_results$fit1_initial_status != "success"
+
+  boot_initial_any_fail <-
+    boot_initial_fit0_fail | boot_initial_fit1_fail
+
+  boot_final_fit0_fail <-
+    boot_results$fit0_final_status != "success"
+
+  boot_final_fit1_fail <-
+    boot_results$fit1_final_status != "success"
+
+  boot_final_any_fit_fail <-
+    boot_final_fit0_fail | boot_final_fit1_fail
+
+  boot_both_final_fit_ok <-
+    !boot_final_fit0_fail & !boot_final_fit1_fail
+
+  boot_functional_fail <-
+    boot_both_final_fit_ok &
+    boot_results$functional_status != "success"
+
+  boot_overall_fail <-
+    boot_results$final_status != "success"
+
+  n_fit0_rescued <-
+    sum(
+      boot_initial_fit0_fail &
+      !boot_final_fit0_fail
+    )
+
+  n_fit1_rescued <-
+    sum(
+      boot_initial_fit1_fail &
+      !boot_final_fit1_fail
+    )
+
+} else {
+
+  boot_initial_fit0_fail <- logical(0)
+  boot_initial_fit1_fail <- logical(0)
+  boot_initial_any_fail <- logical(0)
+
+  boot_final_fit0_fail <- logical(0)
+  boot_final_fit1_fail <- logical(0)
+  boot_final_any_fit_fail <- logical(0)
+
+  boot_both_final_fit_ok <- logical(0)
+  boot_functional_fail <- logical(0)
+  boot_overall_fail <- logical(0)
+
+  n_fit0_rescued <- 0L
+  n_fit1_rescued <- 0L
+}
+
+# Summary
+
+booted <-
+  point_ok &
+  is.finite(mc_results$n_boot_attempted)
+
+if (any(booted)) {
+
+  rescue_change <- mc_results$abs_se_change_rescue_pct[booted]
+  rescue_change <- rescue_change[is.finite(rescue_change)]
+
+  mean_shift <- mc_results$abs_mean_shift_in_SE[booted]
+  mean_shift <- mean_shift[is.finite(mean_shift)]
+
+  worst_tail <- apply(
+    cbind(
+      abs(mc_results$tail_low_change_pct[booted]),
+      abs(mc_results$tail_high_change_pct[booted]),
+      abs(mc_results$tail_split_change_pct[booted])
+    ),
+    1,
+    max,
+    na.rm = TRUE
+  )
+
+  mean_se_final <-
+    mean(mc_results$se_after_rescue[infer_ok])
+
+  mean_se_tail_low <-
+    mean(mc_results$se_tail_low[infer_ok])
+
+  mean_se_tail_high <-
+    mean(mc_results$se_tail_high[infer_ok])
+
+  mean_se_tail_split <-
+    mean(mc_results$se_tail_split[infer_ok])
+
+  tail_mean_low_change_pct <-
+    100 * (mean_se_tail_low - mean_se_final) / mean_se_final
+
+  tail_mean_high_change_pct <-
+    100 * (mean_se_tail_high - mean_se_final) / mean_se_final
+
+  tail_mean_split_change_pct <-
+    100 * (mean_se_tail_split - mean_se_final) / mean_se_final
+
+} else {
+
+  rescue_change <- numeric(0)
+  mean_shift <- numeric(0)
+  worst_tail <- numeric(0)
+
+  mean_se_final <- NA_real_
+  mean_se_tail_low <- NA_real_
+  mean_se_tail_high <- NA_real_
+  mean_se_tail_split <- NA_real_
+
+  tail_mean_low_change_pct <- NA_real_
+  tail_mean_high_change_pct <- NA_real_
+  tail_mean_split_change_pct <- NA_real_
+}
+
+# Summary
+
+summary_results <- data.frame(
+  scenario =
+    "Gaussian + lognormal margins (median ratio 1.25) + dual interval censoring + independent visits + trimmed WR",
+
+  test_run = TEST_RUN,
+  sample_size_per_arm = size,
+  sieve_k = k.i,
+  tau = tau_analysis,
+  tau_lower = tau_lower,
+  margin_family = "lognormal",
+  primary_control_meanlog = m10,
+  primary_treatment_meanlog = m11,
+  secondary_control_meanlog = m20,
+  secondary_treatment_meanlog = m21,
+  primary_sdlog = s10,
+  secondary_sdlog = s20,
+  gaussian_rho = rho,
+  gaussian_kendall_tau = kendall_tau_gaussian,
+  M_generated = M,
+  B_fixed = B,
+
+  true_logwr = true_log_wr,
+  true_wr = true_wr,
+
+  n_valid_point_estimates = n_point,
+  n_with_bootstrap_se = n_infer,
+
+  mean_logwr = mean_logwr,
+  bias_logwr = bias_logwr,
+  ESE_logwr_all_point_estimates = ese_logwr_all,
+  ESE_logwr_inference_subset = ese_logwr_infer,
+  ASE_logwr = ase_logwr,
+  coverage95_log = coverage95,
+
+  mean_wr = mean_wr,
+  bias_wr = bias_wr,
+  ESE_wr = ese_wr,
+  ASE_wr_delta = ase_wr_delta,
+
+  original_control_fit_failures = sum(orig_fit0_fail),
+  original_treatment_fit_failures = sum(orig_fit1_fail),
+  original_any_fit_failures = sum(orig_any_fit_fail),
+  original_any_fit_failure_pct =
+    100 * mean(orig_any_fit_fail),
+  original_functional_failures = sum(orig_functional_fail),
+
+  bootstrap_total_attempted = nrow(boot_results),
+
+  bootstrap_initial_control_failures =
+    sum(boot_initial_fit0_fail),
+
+  bootstrap_initial_treatment_failures =
+    sum(boot_initial_fit1_fail),
+
+  bootstrap_initial_any_fit_failures =
+    sum(boot_initial_any_fail),
+
+  bootstrap_initial_any_fit_failure_pct =
+    if (length(boot_initial_any_fail) > 0L)
+      100 * mean(boot_initial_any_fail)
+    else NA_real_,
+
+  bootstrap_control_fits_rescued = n_fit0_rescued,
+  bootstrap_treatment_fits_rescued = n_fit1_rescued,
+
+  bootstrap_residual_control_fit_failures =
+    sum(boot_final_fit0_fail),
+
+  bootstrap_residual_treatment_fit_failures =
+    sum(boot_final_fit1_fail),
+
+  bootstrap_residual_any_fit_failures =
+    sum(boot_final_any_fit_fail),
+
+  bootstrap_residual_any_fit_failure_pct =
+    if (length(boot_final_any_fit_fail) > 0L)
+      100 * mean(boot_final_any_fit_fail)
+    else NA_real_,
+
+  bootstrap_functional_failures =
+    sum(boot_functional_fail),
+
+  bootstrap_overall_unusable =
+    sum(boot_overall_fail),
+
+  bootstrap_overall_unusable_pct =
+    if (length(boot_overall_fail) > 0L)
+      100 * mean(boot_overall_fail)
+    else NA_real_,
+
+  median_dataset_residual_unusable_pct =
+    if (any(booted))
+      median(mc_results$residual_unusable_pct[booted], na.rm = TRUE)
+    else NA_real_,
+
+  max_dataset_residual_unusable_pct =
+    if (any(booted))
+      max(mc_results$residual_unusable_pct[booted], na.rm = TRUE)
+    else NA_real_,
+
+  median_abs_SE_change_after_rescue_pct =
+    if (length(rescue_change) > 0L)
+      median(rescue_change)
+    else NA_real_,
+
+  p95_abs_SE_change_after_rescue_pct =
+    if (length(rescue_change) > 0L)
+      as.numeric(quantile(rescue_change, 0.95))
+    else NA_real_,
+
+  max_abs_SE_change_after_rescue_pct =
+    if (length(rescue_change) > 0L)
+      max(rescue_change)
+    else NA_real_,
+
+  mean_abs_bootstrap_mean_shift_in_SE =
+    if (length(mean_shift) > 0L)
+      mean(mean_shift)
+    else NA_real_,
+
+  mean_SE_tail_low_change_pct =
+    tail_mean_low_change_pct,
+
+  mean_SE_tail_high_change_pct =
+    tail_mean_high_change_pct,
+
+  mean_SE_tail_split_change_pct =
+    tail_mean_split_change_pct,
+
+  p95_worst_dataset_tail_SE_change_pct =
+    if (length(worst_tail) > 0L)
+      as.numeric(quantile(worst_tail, 0.95))
+    else NA_real_,
+
+  max_worst_dataset_tail_SE_change_pct =
+    if (length(worst_tail) > 0L)
+      max(worst_tail)
+    else NA_real_,
+
+  elapsed_seconds =
+    unname((proc.time() - ptm)["elapsed"]),
+
+  stringsAsFactors = FALSE
+)
+
+## Retain every original summary field and append the paired-target fields.
+summary_results$true_logwr_untrimmed <- true_log_wr_untrimmed
+summary_results$true_wr_untrimmed <- true_wr_untrimmed
+summary_results$n_valid_point_estimates_untrimmed <- performance_results$n_valid_point_estimates[2L]
+summary_results$n_with_bootstrap_se_untrimmed <- performance_results$n_with_bootstrap_SE[2L]
+summary_results$mean_logwr_untrimmed <- performance_results$mean_logWR[2L]
+summary_results$bias_logwr_untrimmed <- performance_results$bias_logWR[2L]
+summary_results$ESE_logwr_all_untrimmed <- performance_results$ESE_logWR_all[2L]
+summary_results$ESE_logwr_inference_subset_untrimmed <- performance_results$ESE_logWR_inference_subset[2L]
+summary_results$ASE_logwr_untrimmed <- performance_results$ASE_logWR[2L]
+summary_results$coverage95_log_untrimmed <- performance_results$coverage95[2L]
+summary_results$mean_paired_untrimmed_minus_trimmed_logwr <- mean_paired_logwr_diff
+summary_results$max_abs_paired_logwr_difference <- max_abs_paired_logwr_diff
+
+## FAILURE REASONS
+
+failure_reasons <-
+  make_failure_reason_table(
+    mc_results,
+    boot_results
+  )
+
+# Output
+
+performance_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_performance_trimmed_vs_untrimmed.csv")
+)
+
+summary_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_summary.csv")
+)
+
+mc_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_MC_results.csv")
+)
+
+boot_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_bootstrap_diagnostics.csv")
+)
+
+reason_file <- file.path(
+  OUTPUT_DIR,
+  paste0(output_tag, "_failure_reasons.csv")
+)
+
+write.csv(
+  performance_results,
+  performance_file,
+  row.names = FALSE
+)
+
+write.csv(
+  summary_results,
+  summary_file,
+  row.names = FALSE
+)
+
+write.csv(
+  mc_results,
+  mc_file,
+  row.names = FALSE
+)
+
+write.csv(
+  boot_results,
+  boot_file,
+  row.names = FALSE
+)
+
+write.csv(
+  failure_reasons,
+  reason_file,
+  row.names = FALSE
+)
+
+## CONSOLE REPORT
+
+cat("\n\n")
+cat("============================================================\n")
+cat("FINAL REVISION SIMULATION REPORT\n")
+cat("============================================================\n")
+
+cat("\nScenario:\n")
+cat(summary_results$scenario, "\n")
+
+cat("\nDesign:\n")
+cat("Fixed generated datasets M =", M, "\n")
+cat("Fixed bootstrap draws B    =", B, "\n")
+cat("Sample size per arm         =", size, "\n")
+cat("Sieve dimension k           =", k.i, "\n")
+cat("Analysis horizon tau        =", tau_analysis, "\n")
+cat("Restricted lower limit tau_l =", tau_lower, "\n")
+cat("Gaussian rho                 =", rho, "\n")
+cat("Gaussian Kendall tau         =", kendall_tau_gaussian, "\n")
+cat("Exploratory untrimmed lower limit =", tau_lower_untrimmed, "\n")
+
+cat("\nPaired statistical performance -- SAME datasets and SAME bootstrap fits:\n")
+print(performance_results, row.names = FALSE)
+cat("\nPaired [untrimmed - trimmed] log-WR mean =", mean_paired_logwr_diff, "\n")
+cat("Maximum absolute paired log-WR difference =", max_abs_paired_logwr_diff, "\n")
+
+cat("\nStatistical performance -- log-WR scale (TRIMMED primary target):\n")
+cat("True log-WR                =", true_log_wr, "\n")
+cat("Valid point estimates      =", n_point, "of", M, "\n")
+cat("Datasets with bootstrap SE =", n_infer, "\n")
+cat("Mean estimate              =", mean_logwr, "\n")
+cat("Bias                       =", bias_logwr, "\n")
+cat("ESE (all valid points)     =", ese_logwr_all, "\n")
+cat("ESE (inference subset)     =", ese_logwr_infer, "\n")
+cat("ASE                        =", ase_logwr, "\n")
+cat("95% coverage               =", coverage95, "\n")
+
+cat("\nOriginal-fit numerical stability:\n")
+cat(
+  "Any-arm fit failures =",
+  sum(orig_any_fit_fail), "of", M,
+  sprintf("(%.2f%%)\n", 100 * mean(orig_any_fit_fail))
+)
+cat("  Control fit failures   =", sum(orig_fit0_fail), "\n")
+cat("  Treatment fit failures =", sum(orig_fit1_fail), "\n")
+cat("Downstream WR failures after both fits succeeded =",
+    sum(orig_functional_fail), "\n")
+
+cat("\nWeighted-bootstrap numerical stability:\n")
+cat("Total fixed multiplier draws attempted =", nrow(boot_results), "\n")
+
+if (nrow(boot_results) > 0L) {
+  cat(
+    "Initial any-arm fit failures =",
+    sum(boot_initial_any_fail),
+    sprintf("(%.2f%%)\n", 100 * mean(boot_initial_any_fail))
+  )
+
+  cat(
+    "  Control fits rescued   =",
+    n_fit0_rescued, "of", sum(boot_initial_fit0_fail),
+    "initial control failures\n"
+  )
+
+  cat(
+    "  Treatment fits rescued =",
+    n_fit1_rescued, "of", sum(boot_initial_fit1_fail),
+    "initial treatment failures\n"
+  )
+
+  cat(
+    "Residual any-arm fit failures after rescue =",
+    sum(boot_final_any_fit_fail),
+    sprintf("(%.2f%%)\n", 100 * mean(boot_final_any_fit_fail))
+  )
+
+  cat(
+    "Downstream WR failures conditional on successful weighted fits =",
+    sum(boot_functional_fail),
+    "of", sum(boot_both_final_fit_ok),
+    "\n"
+  )
+
+  cat(
+    "Overall unusable fixed multiplier draws =",
+    sum(boot_overall_fail),
+    sprintf("(%.2f%%)\n", 100 * mean(boot_overall_fail))
+  )
+}
+
+cat("\nSensitivity to numerically difficult / unresolved draws:\n")
+
+if (length(rescue_change) > 0L) {
+  cat(
+    "Median absolute SE change after adding rescued draws =",
+    median(rescue_change), "%\n"
+  )
+  cat(
+    "95th percentile absolute SE change after rescue     =",
+    as.numeric(quantile(rescue_change, 0.95)), "%\n"
+  )
+  cat(
+    "Maximum absolute SE change after rescue             =",
+    max(rescue_change), "%\n"
+  )
+}
+
+cat(
+  "Mean-SE change under lower-tail stress =",
+  tail_mean_low_change_pct, "%\n"
+)
+cat(
+  "Mean-SE change under upper-tail stress =",
+  tail_mean_high_change_pct, "%\n"
+)
+cat(
+  "Mean-SE change under split-tail stress =",
+  tail_mean_split_change_pct, "%\n"
+)
+
+cat("\nFailure reasons:\n")
+if (nrow(failure_reasons) > 0L) {
+  print(failure_reasons)
+} else {
+  cat("No recorded numerical failures.\n")
+}
+
+cat("\nSaved files:\n")
+cat(" ", performance_file, "\n")
+cat(" ", summary_file, "\n")
+cat(" ", mc_file, "\n")
+cat(" ", boot_file, "\n")
+cat(" ", reason_file, "\n")
+
+cat("\nElapsed time (seconds):",
+    summary_results$elapsed_seconds, "\n")
+
+cat("============================================================\n")
