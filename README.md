@@ -38,18 +38,25 @@ the estimand/theory used in the analysis.
 
 ## Installation
 
-Build and check the package with:
+To install the package directly from GitHub, run the following commands
+in R or RStudio:
+
+```r
+install.packages("remotes")
+remotes::install_github("Yuan-Wu-repo/winratioIC")
+library(winratioIC)
+```
+
+The examples below use datasets included with the package and can
+be run directly after installation.
+
+## Package building and checking (for developers)
+
+To build and check the package from the source directory:
 
 ```sh
 R CMD build winratioIC
 R CMD check winratioIC_1.0.0.tar.gz
-```
-
-Install the built source package in R with:
-
-```r
-install.packages("winratioIC_1.0.0.tar.gz", repos = NULL, type = "source")
-library(winratioIC)
 ```
 
 ## Interval-censored input
@@ -136,6 +143,12 @@ fit <- winratio_ic(
 )
 fit
 ```
+
+## Simulation code
+
+The simulation programs used in the accompanying manuscript are available
+in the [simulations](simulations/) folder. These files contain R code
+for the mixed-censoring and dual interval-censoring simulation settings.
 
 ## Main output
 
