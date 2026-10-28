@@ -1,0 +1,6 @@
+export(winratio_ic)
+S3method(print,winratio_ic)
+importFrom(splines,splineDesign)
+importFrom(stats,optim)
+importFrom(stats,quantile)
+importFrom(stats,setNames)

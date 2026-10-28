@@ -1,0 +1,17 @@
+Package: winratioIC
+Type: Package
+Title: Win Ratio Estimation with Interval and Mixed Censoring
+Version: 1.0.0
+Authors@R: person("Zhiguo", "Li", email = "zhiguo.li@duke.edu", role = c("aut", "cre"))
+Description: Estimates win probabilities, loss probabilities, win ratios, and
+    weighted-bootstrap uncertainty for two prioritized time-to-event outcomes.
+    The current version supports two interval-censored margins and a
+    right-censored higher-priority margin with an interval-censored secondary
+    margin. A user-selectable lower integration bound permits trimmed and
+    untrimmed win-ratio targets. The implementation uses the spline-sieve
+    likelihood and win-ratio functionals supplied with the companion methodology.
+License: GPL-3
+Encoding: UTF-8
+Imports: splines, stats
+RoxygenNote: 7.3.2
+NeedsCompilation: no
